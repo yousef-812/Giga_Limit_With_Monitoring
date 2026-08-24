@@ -1,6 +1,9 @@
-name: Build Android APK
+name: Build GigaLimit Server EXE and Mobile APK
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -14,6 +17,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Build Server EXE
+        working-directory: server
+        run: |
+          npm ci || npm install
+          npm run build:exe
+
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
@@ -23,7 +37,7 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.44.0'
+          flutter-version: '3.29.0'
           channel: 'stable'
 
       - name: Setup Go
@@ -97,11 +111,13 @@ jobs:
           git tag $TAG
           git push origin $TAG
 
-      - name: Release APK
+      - name: Release APK & EXE
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.0-${{ github.run_number }}
-          name: "GigaLimit v1.0.0-${{ github.run_number }}"
-          files: mobile_app/build/app/outputs/flutter-apk/GigaLimit_App.apk
+          name: "GigaLimit With Monitoring v1.0.0-${{ github.run_number }}"
+          files: |
+            mobile_app/build/app/outputs/flutter-apk/GigaLimit_App.apk
+            server/GigaLimit_Server.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

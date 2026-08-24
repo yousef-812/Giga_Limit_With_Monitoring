@@ -1,72 +1,120 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 // Save the database file in the same directory where the executable is run
-const dbPath = path.join(process.cwd(), 'giga_limit_db.json');
-const dbTmpPath = path.join(process.cwd(), 'giga_limit_db.json.tmp');
-const dbBakPath = path.join(process.cwd(), 'giga_limit_db.json.bak');
+const appDir = typeof process.pkg !== 'undefined'
+    ? path.dirname(process.execPath)
+    : process.cwd();
+const dbPath = path.join(appDir, 'giga_limit_db.json');
+const backupPath = path.join(appDir, 'giga_limit_db.json.bak');
 
-let data = {
-    settings: {
-        admin_password: 'admin123',
-        global_daily_limit_mb: 1024,
-        global_weekly_limit_mb: 7168,
-        target_apps: ["instagram", "whatsapp", "facebook", "snapchat", "tiktok"],
-        auto_renew_daily_enabled: true,
-        auto_renew_daily_time: "00:00",
-        auto_renew_weekly_enabled: true,
-        auto_renew_weekly_time: "00:00",
-        throttle_enabled: true,
-        throttle_speed_kbps: 50
-    },
+const generatePassword = () => {
+    return crypto.randomBytes(6).toString('base64url');
+};
+
+const emptyData = {
+    settings: {},
     users: [], // { id, name, device_id, current_ip, status, daily_limit_mb }
     usage: [] // { user_id, date, bytes_used }
 };
 
-// Helper: try to load a JSON file safely, return parsed data or null
-const tryLoadJson = (filePath) => {
+const readDatabase = (filePath) => {
+    if (!fs.existsSync(filePath)) return null;
     try {
-        if (fs.existsSync(filePath)) {
-            const content = fs.readFileSync(filePath, 'utf8');
-            if (content && content.trim().length > 0) {
-                return JSON.parse(content);
-            }
+        const raw = fs.readFileSync(filePath, 'utf8').trim();
+        if (!raw) return null;
+        const fileData = JSON.parse(raw);
+        if (!fileData || typeof fileData !== 'object' || !Array.isArray(fileData.users) || !Array.isArray(fileData.usage)) {
+            return null;
         }
+        return {
+            ...emptyData,
+            ...fileData,
+            settings: { ...emptyData.settings, ...fileData.settings }
+        };
     } catch (e) {
-        // corrupted or unreadable
+        return null;
     }
-    return null;
 };
 
-// Startup recovery: try main → backup → tmp → fresh
-let fileData = tryLoadJson(dbPath);
-if (!fileData) {
-    console.warn('[DB] Main db file corrupted or missing, trying backup...');
-    fileData = tryLoadJson(dbBakPath);
-    if (fileData) {
-        console.log('[DB] Recovered from backup file.');
-        // Restore backup as main
-        try { fs.copyFileSync(dbBakPath, dbPath); } catch (e) {}
-    }
-}
-if (!fileData) {
-    fileData = tryLoadJson(dbTmpPath);
-    if (fileData) {
-        console.log('[DB] Recovered from tmp file.');
-        try { fs.copyFileSync(dbTmpPath, dbPath); } catch (e) {}
-    }
-}
-if (fileData) {
-    data = { ...data, ...fileData };
-    if (data.settings && data.settings.global_total_bytes_used === undefined) {
-        data.settings.global_total_bytes_used = 0;
-    }
-    if (data.settings && data.settings.target_apps === undefined) {
-        data.settings.target_apps = ["instagram", "whatsapp", "facebook", "snapchat", "tiktok"];
-    }
+let data = readDatabase(dbPath);
+let restoredFromBackup = false;
+let hasValidBackup = false;
+if (!data) {
+    data = readDatabase(backupPath);
+    hasValidBackup = Boolean(data);
+    restoredFromBackup = Boolean(data);
 } else {
-    console.log('[DB] No valid db file found, starting fresh.');
+    hasValidBackup = Boolean(readDatabase(backupPath));
 }
+if (!data) data = { ...emptyData, settings: {}, users: [], usage: [] };
+if (data.settings.global_total_bytes_used === undefined) data.settings.global_total_bytes_used = 0;
+
+const writeAtomically = (filePath, value) => {
+    const tempPath = `${filePath}.${process.pid}.tmp`;
+    fs.writeFileSync(tempPath, JSON.stringify(value, null, 2));
+    let lastError;
+    for (let attempt = 0; attempt < 10; attempt++) {
+        try {
+            fs.renameSync(tempPath, filePath);
+            return;
+        } catch (error) {
+            lastError = error;
+            if (!['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) break;
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+        }
+    }
+
+    // OneDrive can temporarily lock the destination on Windows. Copying the
+    // completed temp file is a safe fallback and avoids terminating the server.
+    try {
+        fs.copyFileSync(tempPath, filePath);
+        fs.unlinkSync(tempPath);
+    } catch (error) {
+        try { fs.unlinkSync(tempPath); } catch (_) {}
+        throw lastError || error;
+    }
+};
+
+let saveRetryTimer = null;
+const scheduleSaveRetry = () => {
+    if (saveRetryTimer) return;
+    saveRetryTimer = setTimeout(() => {
+        saveRetryTimer = null;
+        save();
+    }, 1000);
+    saveRetryTimer.unref();
+};
+
+const save = () => {
+    try {
+        writeAtomically(dbPath, data);
+        return true;
+    } catch (error) {
+        console.error(`[DB] Could not save database; retrying: ${error.code || error.message}`);
+        scheduleSaveRetry();
+        return false;
+    }
+};
+
+const saveBackup = () => {
+    try {
+        writeAtomically(backupPath, data);
+    } catch (error) {
+        console.error(`[DB] Could not save backup: ${error.code || error.message}`);
+    }
+};
+
+if (!data.settings.admin_password || data.settings.admin_password === 'admin123') {
+    data.settings.admin_password = generatePassword();
+}
+
+const credPath = path.join(appDir, 'admin_credentials.txt');
+if (!data.settings.global_daily_limit_mb) data.settings.global_daily_limit_mb = 1024;
+if (!data.settings.global_weekly_limit_mb) data.settings.global_weekly_limit_mb = 7168;
+if (data.settings.global_speed_limit_bps === undefined) data.settings.global_speed_limit_bps = 0;
+if (data.settings.global_exhausted_speed_limit_bps === undefined) data.settings.global_exhausted_speed_limit_bps = 0;
 
 const getLocalDateString = () => {
     const d = new Date();
@@ -76,26 +124,12 @@ const getLocalDateString = () => {
     return `${year}-${month}-${day}`;
 };
 
-const save = () => {
-    try {
-        const jsonStr = JSON.stringify(data, null, 2);
-        // Write to tmp file first
-        fs.writeFileSync(dbTmpPath, jsonStr);
-        // Backup current main file before overwriting
-        if (fs.existsSync(dbPath)) {
-            try { fs.copyFileSync(dbPath, dbBakPath); } catch (e) {}
-        }
-        // Copy tmp → main (works on Windows/OneDrive unlike rename)
-        fs.copyFileSync(dbTmpPath, dbPath);
-        // Clean up tmp
-        try { fs.unlinkSync(dbTmpPath); } catch (e) {}
-    } catch (e) {
-        console.error('[DB] Error saving database:', e.message);
-    }
-};
-
-// Ensure initial save
+// Persist a complete primary database immediately. A missing, empty, or invalid
+// primary is restored from the hourly backup before this write occurs.
 save();
+if (restoredFromBackup || !hasValidBackup) saveBackup();
+setInterval(saveBackup, 60 * 60 * 1000).unref();
+fs.writeFileSync(credPath, `Admin Password: ${data.settings.admin_password}\n`);
 
 module.exports = {
     getSetting: (key) => data.settings[key],
@@ -117,6 +151,8 @@ module.exports = {
                     current_ip: ip,
                     daily_limit_mb: default_limit,
                     weekly_limit_mb: default_limit * 7,
+                    speed_limit_bps: null,
+                    exhausted_speed_limit_bps: null,
                     status: 'active',
                     registered_at: getLocalDateString()
                 };
@@ -139,6 +175,7 @@ module.exports = {
     },
 
     getUserByDeviceId: (device_id) => data.users.find(u => u.device_id === device_id),
+    getUserById: (id) => data.users.find(u => u.id === parseInt(id)),
     
     getUserByIp: (ip) => data.users.find(u => u.current_ip === ip),
 
@@ -156,16 +193,6 @@ module.exports = {
         let user = data.users.find(u => u.id === parseInt(id));
         if (user) {
             delete user.pending_notification;
-            save();
-            return true;
-        }
-        return false;
-    },
-
-    setMonitoring: (id, enabled) => {
-        let user = data.users.find(u => u.id === parseInt(id));
-        if (user) {
-            user.monitoring_enabled = enabled;
             save();
             return true;
         }
@@ -220,12 +247,14 @@ module.exports = {
         });
     },
 
-    updateUserSettings: (id, status, daily_limit_mb, weekly_limit_mb) => {
+    updateUserSettings: (id, status, daily_limit_mb, weekly_limit_mb, speed_limit_bps, exhausted_speed_limit_bps) => {
         let user = data.users.find(u => u.id === parseInt(id));
         if (user) {
             user.status = status;
             user.daily_limit_mb = parseInt(daily_limit_mb);
             if(weekly_limit_mb) user.weekly_limit_mb = parseInt(weekly_limit_mb);
+            if (speed_limit_bps !== undefined) user.speed_limit_bps = speed_limit_bps === null ? null : Math.max(0, Number(speed_limit_bps) || 0);
+            if (exhausted_speed_limit_bps !== undefined) user.exhausted_speed_limit_bps = exhausted_speed_limit_bps === null ? null : Math.max(0, Number(exhausted_speed_limit_bps) || 0);
             save();
             return true;
         }
@@ -275,12 +304,14 @@ module.exports = {
         save();
     },
 
-    updateGlobalLimit: (daily_limit, weekly_limit) => {
+    updateGlobalLimit: (daily_limit, weekly_limit, speed_limit_bps, exhausted_speed_limit_bps) => {
         const old_daily = data.settings.global_daily_limit_mb;
         const old_weekly = data.settings.global_weekly_limit_mb || (old_daily * 7);
         
         data.settings.global_daily_limit_mb = parseInt(daily_limit);
         data.settings.global_weekly_limit_mb = parseInt(weekly_limit);
+        if (speed_limit_bps !== undefined) data.settings.global_speed_limit_bps = Math.max(0, Number(speed_limit_bps) || 0);
+        if (exhausted_speed_limit_bps !== undefined) data.settings.global_exhausted_speed_limit_bps = Math.max(0, Number(exhausted_speed_limit_bps) || 0);
 
         // Apply to users who hadn't been manually customized
         data.users.forEach(u => {
@@ -297,6 +328,8 @@ module.exports = {
         if (user) {
             user.daily_limit_mb = data.settings.global_daily_limit_mb;
             user.weekly_limit_mb = data.settings.global_weekly_limit_mb || (data.settings.global_daily_limit_mb * 7);
+            user.speed_limit_bps = null;
+            user.exhausted_speed_limit_bps = null;
             save();
             return true;
         }
@@ -321,65 +354,5 @@ module.exports = {
             return true;
         }
         return false;
-    },
-
-    resetAllDailyUsage: () => {
-        const today = getLocalDateString();
-        data.users.forEach(user => {
-            let usage = data.usage.find(u => u.user_id === user.id && u.date === today);
-            if (usage) {
-                usage.bytes_used = 0;
-            } else {
-                data.usage.push({ user_id: user.id, date: today, bytes_used: 0 });
-            }
-        });
-        save();
-        console.log(`[Auto-Renew] Daily usage reset for all users at ${new Date().toLocaleTimeString()}`);
-    },
-
-    resetAllWeeklyUsage: () => {
-        const todayStr = getLocalDateString();
-        const today = new Date(todayStr);
-        const day = today.getDay();
-        const daysSinceSaturday = (day + 1) % 7;
-
-        data.users.forEach(user => {
-            for (let i = 0; i <= daysSinceSaturday; i++) {
-                const d = new Date(today);
-                d.setDate(d.getDate() - i);
-                const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-                let usage = data.usage.find(u => u.user_id === user.id && u.date === dateStr);
-                if (usage) usage.bytes_used = 0;
-            }
-            user.weekly_offset = 0;
-        });
-        save();
-        console.log(`[Auto-Renew] Weekly usage reset for all users at ${new Date().toLocaleTimeString()}`);
-    },
-
-    getAutoRenewSettings: () => ({
-        auto_renew_daily_enabled: data.settings.auto_renew_daily_enabled !== false,
-        auto_renew_daily_time: data.settings.auto_renew_daily_time || "00:00",
-        auto_renew_weekly_enabled: data.settings.auto_renew_weekly_enabled !== false,
-        auto_renew_weekly_time: data.settings.auto_renew_weekly_time || "00:00"
-    }),
-
-    setAutoRenewSettings: (settings) => {
-        if (settings.auto_renew_daily_enabled !== undefined) data.settings.auto_renew_daily_enabled = settings.auto_renew_daily_enabled;
-        if (settings.auto_renew_daily_time !== undefined) data.settings.auto_renew_daily_time = settings.auto_renew_daily_time;
-        if (settings.auto_renew_weekly_enabled !== undefined) data.settings.auto_renew_weekly_enabled = settings.auto_renew_weekly_enabled;
-        if (settings.auto_renew_weekly_time !== undefined) data.settings.auto_renew_weekly_time = settings.auto_renew_weekly_time;
-        save();
-    },
-
-    getThrottleSettings: () => ({
-        throttle_enabled: data.settings.throttle_enabled !== false,
-        throttle_speed_kbps: data.settings.throttle_speed_kbps || 50
-    }),
-
-    setThrottleSettings: (settings) => {
-        if (settings.throttle_enabled !== undefined) data.settings.throttle_enabled = settings.throttle_enabled;
-        if (settings.throttle_speed_kbps !== undefined) data.settings.throttle_speed_kbps = parseInt(settings.throttle_speed_kbps);
-        save();
     }
 };

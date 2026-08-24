@@ -14,6 +14,15 @@ mobile_app/android/app/src/main/jniLibs/
 mobile_app/android/**/GeneratedPluginRegistrant.java
 mobile_app/android/**/GeneratedPluginRegistrant.kt
 
+# Binaries & APKs
+*.apk
+*.exe
+GigaLimit_App.apk
+
+# Go tun2socks
+mobile_app/tun2socks/tun2socks
+mobile_app/tun2socks/*.exe
+
 # Server
 server/node_modules/
 server/giga_limit_db.json
@@ -21,8 +30,10 @@ server/giga_limit_db.json.bak
 server/admin_credentials.txt
 server/vpn_debug.log
 server/GigaLimit_Server.exe
+server/GigaLimit_App.apk
 server/server.key
 server/server.cert
+server/public_bundle.js
 
 # Mobile Capacitor
 mobile/node_modules/
