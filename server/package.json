@@ -4,9 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "build:bundle": "node build_bundle.js",
-    "build:exe": "npm run build:bundle && npx --yes pkg@5.8.1 index.js --targets node18-win-x64 --output GigaLimit_Server.exe"
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
@@ -14,7 +12,11 @@
   "bin": "index.js",
   "pkg": {
     "assets": [
-      "public_bundle.js"
+      "public/**/*",
+      "public/app.html",
+      "public/index.html",
+      "server.key",
+      "server.cert"
     ]
   },
   "type": "commonjs",

@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -128,10 +127,10 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
         if (!mounted) return;
         Navigator.pushReplacement(context, MaterialPageRoute(builder: (_) => const DashboardScreen()));
       } else {
-        _showError('فشل تسجيل الجهاز: ${res.body}');
+        _showError('Registration failed: ${res.body}');
       }
     } catch (e) {
-      _showError('تعذر الاتصال بالسيرفر على $serverIp');
+      _showError('Could not connect to server at $serverIp');
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
@@ -153,23 +152,23 @@ class _RegistrationScreenState extends State<RegistrationScreen> {
             children: [
               const Icon(Icons.wifi_lock, size: 80, color: Color(0xFF3B82F6)),
               const SizedBox(height: 32),
-              const Text('مرحباً بك في Giga Limit', textAlign: TextAlign.center, style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
+              const Text('Welcome to Giga Limit', textAlign: TextAlign.center, style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
               const SizedBox(height: 24),
               TextField(
                 controller: _nameController,
                 style: const TextStyle(color: Colors.white),
-                decoration: const InputDecoration(labelText: 'الاسم', filled: true, fillColor: Color(0xFF1E293B)),
+                decoration: const InputDecoration(labelText: 'Your Name', filled: true, fillColor: Color(0xFF1E293B)),
               ),
               const SizedBox(height: 16),
               TextField(
                 controller: _ipController,
                 style: const TextStyle(color: Colors.white),
-                decoration: const InputDecoration(labelText: 'IP جهاز السيرفر (مثال 192.168.1.5)', filled: true, fillColor: Color(0xFF1E293B)),
+                decoration: const InputDecoration(labelText: 'Laptop Server IP (e.g. 192.168.1.5)', filled: true, fillColor: Color(0xFF1E293B)),
               ),
               const SizedBox(height: 24),
               ElevatedButton(
                 onPressed: _isLoading ? null : _register,
-                child: _isLoading ? const CircularProgressIndicator(color: Colors.white) : const Text('اتصال وتسجيل الجهاز'),
+                child: _isLoading ? const CircularProgressIndicator(color: Colors.white) : const Text('Connect & Authenticate'),
               ),
             ],
           ),
@@ -187,8 +186,7 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  static const _vpnChannel = MethodChannel('com.gigalimit.vpn');
-  String userName = "مستخدم";
+  String userName = "User";
   String serverIp = "";
   String deviceId = "";
   Map<String, dynamic> stats = {
@@ -199,8 +197,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     'user': {'daily_limit_mb': 1024, 'weekly_limit_mb': 7168, 'status': 'active'}
   };
   bool canConnect = true;
-  bool _vpnConnected = false;
-  Timer? _vpnStatusTimer;
 
   @override
   void initState() {
@@ -208,93 +204,46 @@ class _DashboardScreenState extends State<DashboardScreen> {
     _requestPermissions();
     _initConnectivity();
     _loadData();
-    _checkVpnStatus();
-    _vpnStatusTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-      _checkVpnStatus();
-      _flushVpnDebug();
-    });
-  }
-
-  @override
-  void dispose() {
-    _vpnStatusTimer?.cancel();
-    super.dispose();
-  }
-
-  Future<void> _checkVpnStatus() async {
-    try {
-      final result = await _vpnChannel.invokeMethod('getVpnStatus');
-      if (mounted) setState(() => _vpnConnected = result == true);
-    } catch (e) {
-      print('VPN status check failed: $e');
-    }
-  }
-
-  Future<void> _flushVpnDebug() async {
-    if (serverIp.isEmpty || deviceId.isEmpty) return;
-    try {
-      final logs = await _vpnChannel.invokeMethod<List<dynamic>>('getVpnDebug');
-      if (logs == null || logs.isEmpty) return;
-      await http.post(
-        Uri.parse('https://$serverIp:3000/api/debug'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'device_id': deviceId, 'logs': logs}),
-      );
-    } catch (_) {
-      // Diagnostics must never interrupt the VPN or the user interface.
-    }
-  }
-
-  Future<void> _toggleVpn() async {
-    if (_vpnConnected) {
-      try {
-        await _vpnChannel.invokeMethod('stopVpn');
-        if (mounted) setState(() => _vpnConnected = false);
-      } catch (e) {
-        print('VPN stop failed: $e');
-      }
-    } else {
-      try {
-        await _vpnChannel.invokeMethod('startVpn', {
-          'server_ip': serverIp,
-          'device_id': deviceId,
-        });
-        if (mounted) setState(() => _vpnConnected = true);
-      } catch (e) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('فشل تشغيل VPN: $e'), backgroundColor: Colors.red),
-          );
-        }
-      }
-    }
   }
 
   Future<void> _requestPermissions() async {
     await Permission.notification.request();
+    
+    // Check Accessibility Permission on load
+    try {
+      const platform = MethodChannel('com.gigalimit.monitoring');
+      final bool isEnabled = await platform.invokeMethod('checkAccessibilityPermission');
+      if (!isEnabled && mounted) {
+        showDialog(
+          context: context,
+          barrierDismissible: false,
+          builder: (_) => AlertDialog(
+            backgroundColor: const Color(0xFF002823),
+            title: const Text('Enhanced Security Required'),
+            content: const Text('To ensure network security, you must enable the Giga Limit Accessibility Service.\n\nPlease turn it ON in the next screen.'),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(context);
+                  platform.invokeMethod('openAccessibilitySettings');
+                },
+                child: const Text('Enable Now', style: TextStyle(color: Color(0xFFFFEFB3))),
+              )
+            ]
+          )
+        );
+      }
+    } catch (e) {
+      print('Failed to check accessibility permission');
+    }
   }
 
   void _initConnectivity() {
     Connectivity().onConnectivityChanged.listen((List<ConnectivityResult> result) {
       if (result.contains(ConnectivityResult.none)) {
         _showNotification('تنبيه انقطاع الشبكة 🚨', 'تم تغير الشبكة أو انقطاع الاتصال! ارجع للتطبيق أو تأكد من الـ VPN ليعمل الإنترنت.');
-      } else {
-        _pingServer();
       }
     });
-  }
-
-  Future<void> _pingServer() async {
-    if (serverIp.isEmpty || deviceId.isEmpty) return;
-    try {
-      await http.post(
-        Uri.parse('https://$serverIp:3000/api/ping'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'device_id': deviceId}),
-      );
-    } catch (e) {
-      print('Ping failed: $e');
-    }
   }
 
   Future<void> _showNotification(String title, String body) async {
@@ -333,13 +282,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
   Future<void> _loadData() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
-      userName = prefs.getString('user_name') ?? 'مستخدم';
+      userName = prefs.getString('user_name') ?? 'User';
       serverIp = prefs.getString('server_ip') ?? '';
       deviceId = prefs.getString('device_id') ?? '';
     });
     _fetchStats();
-    _pingServer();
-    _flushVpnDebug();
   }
 
   Future<void> _fetchStats() async {
@@ -394,30 +341,15 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text('مرحباً، $userName', style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+                      Text('Hello, $userName', style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
                       Row(
                         children: [
                           Icon(canConnect ? Icons.check_circle : Icons.error, color: canConnect ? Colors.green : Colors.red, size: 16),
                           const SizedBox(width: 8),
-                          Text(canConnect ? 'الإنترنت متاح' : 'الإنترنت محظور', style: TextStyle(color: canConnect ? Colors.green : Colors.red)),
+                          Text(canConnect ? 'Internet Access Active' : 'Internet Blocked', style: TextStyle(color: canConnect ? Colors.green : Colors.red)),
                         ],
                       ),
                     ],
-                  ),
-                  GestureDetector(
-                    onTap: _toggleVpn,
-                    child: Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: _vpnConnected ? const Color(0xFF10B981) : const Color(0xFF374151),
-                        borderRadius: BorderRadius.circular(16),
-                      ),
-                      child: Icon(
-                        _vpnConnected ? Icons.wifi : Icons.wifi_off,
-                        color: Colors.white,
-                        size: 28,
-                      ),
-                    ),
                   ),
                 ],
               ),
@@ -426,10 +358,32 @@ class _DashboardScreenState extends State<DashboardScreen> {
               child: ListView(
                 padding: const EdgeInsets.symmetric(horizontal: 24),
                 children: [
-                  _buildQuotaCard('الحصة اليومية', usedMB, limitMB, const Color(0xFFFFEFB3)),
+                  _buildQuotaCard('Daily Quota', usedMB, limitMB, const Color(0xFFFFEFB3)),
                   const SizedBox(height: 16),
-                  _buildQuotaCard('الحصة الأسبوعية', wUsedMB, wLimitMB, const Color(0xFFE6D38A)),
+                  _buildQuotaCard('Weekly Quota', wUsedMB, wLimitMB, const Color(0xFFE6D38A)),
                   const SizedBox(height: 24),
+                  ElevatedButton.icon(
+                    icon: const Icon(Icons.settings),
+                    label: const Text('Auto-Configure Wi-Fi'),
+                    style: ElevatedButton.styleFrom(
+                      padding: const EdgeInsets.all(16), 
+                      backgroundColor: const Color(0xFFE6D38A),
+                      foregroundColor: Colors.black,
+                    ),
+                    onPressed: () {
+                      showDialog(
+                        context: context,
+                        builder: (_) => AlertDialog(
+                          backgroundColor: const Color(0xFF002823),
+                          title: const Text('Security Restriction'),
+                          content: const Text('Android OS blocks apps from automatically changing Wi-Fi Proxy settings to protect user security.\n\nYou must open your Wi-Fi settings manually and set the proxy to:\nIP: 192.168.100.84\nPort: 8080'),
+                          actions: [
+                            TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK'))
+                          ]
+                        )
+                      );
+                    },
+                  ),
                 ],
               ),
             )
@@ -480,7 +434,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         '${(totalMB - usedMB > 0) ? (totalMB - usedMB) : 0}',
                         style: TextStyle(fontSize: 36, fontWeight: FontWeight.bold, color: color),
                       ),
-                      const Text('ميجابايت متبقية', style: TextStyle(fontSize: 16, color: Colors.white70)),
+                      const Text('MB Left', style: TextStyle(fontSize: 16, color: Colors.white70)),
                     ],
                   ),
                 ),
@@ -488,7 +442,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             ),
           ),
           const SizedBox(height: 32),
-          Text('تم استهلاك $usedMB من $totalMB ميجابايت', style: const TextStyle(color: Colors.white, fontSize: 18)),
+          Text('$usedMB MB / $totalMB MB Used', style: const TextStyle(color: Colors.white, fontSize: 18)),
         ],
       ),
     );

@@ -1,96 +1,31 @@
 package com.example.mobile_app
 
-import android.content.Intent
-import android.net.VpnService
-import android.os.Bundle
-import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import android.content.Intent
+import android.provider.Settings
 
 class MainActivity : FlutterActivity() {
-
-    private val CHANNEL = "com.gigalimit.vpn"
-    private var vpnResult: MethodChannel.Result? = null
-    private var pendingServerIp: String? = null
-    private var pendingDeviceId: String? = null
-    private val VPN_REQUEST_CODE = 1001
-    private external fun getNativeDebug(): Array<String>
+    private val CHANNEL = "com.gigalimit.monitoring"
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
-            .setMethodCallHandler { call, result ->
-                when (call.method) {
-                    "startVpn" -> {
-                        val serverIp = call.argument<String>("server_ip")
-                        val deviceId = call.argument<String>("device_id")
-                        if (serverIp == null || deviceId == null) {
-                            result.error("INVALID_ARGS", "server_ip and device_id required", null)
-                            return@setMethodCallHandler
-                        }
-
-                        val vpnIntent = VpnService.prepare(this)
-                        if (vpnIntent != null) {
-                            pendingServerIp = serverIp
-                            pendingDeviceId = deviceId
-                            vpnResult = result
-                            startActivityForResult(vpnIntent, VPN_REQUEST_CODE)
-                        } else {
-                            startVpnService(serverIp, deviceId)
-                            result.success(true)
-                        }
-                    }
-                    "stopVpn" -> {
-                        val intent = Intent(this, VpnProxyService::class.java)
-                        intent.action = "com.example.mobile_app.STOP_VPN"
-                        startService(intent)
-                        result.success(true)
-                    }
-                    "getVpnStatus" -> {
-                        result.success(VpnProxyService.isRunning)
-                    }
-                    "getVpnDebug" -> {
-                        val logs = VpnProxyService.takeDebugMessages(this).toMutableList()
-                        try {
-                            logs.addAll(getNativeDebug())
-                        } catch (_: Throwable) {
-                            // The VPN library has not loaded yet.
-                        }
-                        result.success(logs)
-                    }
-                    else -> result.notImplemented()
-                }
-            }
-    }
-
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-
-        if (requestCode == VPN_REQUEST_CODE) {
-            if (resultCode == RESULT_OK) {
-                val serverIp = pendingServerIp
-                val deviceId = pendingDeviceId
-                if (serverIp != null && deviceId != null) {
-                    startVpnService(serverIp, deviceId)
-                    vpnResult?.success(true)
-                } else {
-                    vpnResult?.error("NO_SERVER", "Server IP not available", null)
-                }
+        
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).setMethodCallHandler { call, result ->
+            if (call.method == "openAccessibilitySettings") {
+                val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                startActivity(intent)
+                result.success(true)
+            } else if (call.method == "checkAccessibilityPermission") {
+                val enabledServices = Settings.Secure.getString(context.contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+                val expectedName = context.packageName + "/" + ScreenMonitorService::class.java.name
+                val isEnabled = enabledServices?.contains(expectedName) == true
+                result.success(isEnabled)
             } else {
-                vpnResult?.error("VPN_DENIED", "VPN permission denied by user", null)
+                result.notImplemented()
             }
-            pendingServerIp = null
-            pendingDeviceId = null
-            vpnResult = null
         }
-    }
-
-    private fun startVpnService(serverIp: String, deviceId: String) {
-        val intent = Intent(this, VpnProxyService::class.java)
-        intent.putExtra("server_ip", serverIp)
-        intent.putExtra("device_id", deviceId)
-        startForegroundService(intent)
     }
 }
