@@ -529,6 +529,9 @@
                     <button class="btn-small" style="grid-column: span 2; margin-top: 0.5rem; background: ${(u.monitoring_enabled !== false) ? 'rgba(239, 68, 68, 0.15)' : 'rgba(16, 185, 129, 0.15)'};" onclick="toggleMonitoring(${u.id}, ${(u.monitoring_enabled !== false) ? 'false' : 'true'})">
                         ${(u.monitoring_enabled !== false) ? 'إيقاف متابعة السوشيال ❌' : 'تشغيل متابعة السوشيال 👁️'}
                     </button>
+                    <button class="btn-small" style="grid-column: span 2; margin-top: 0.5rem; background: ${(u.social_blocked === true) ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)'};" onclick="toggleSocial(${u.id}, ${(u.social_blocked === true) ? 'false' : 'true'})">
+                        ${(u.social_blocked === true) ? 'فك منع السوشيال ✅' : 'منع السوشيال 🚫'}
+                    </button>
                 </div>
             `;
             return card;
@@ -674,6 +677,15 @@
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', 'Authorization': authToken },
                 body: JSON.stringify({ id, enabled })
+            });
+            loadUsers();
+        }
+
+        async function toggleSocial(id, blocked) {
+            await fetch('/api/admin/toggle_social', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': authToken },
+                body: JSON.stringify({ id, blocked })
             });
             loadUsers();
         }

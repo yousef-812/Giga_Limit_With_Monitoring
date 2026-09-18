@@ -146,6 +146,54 @@ const verifyNetworkSignature = (deviceId, timestamp, signature) => {
     return valid;
 };
 
+// --- SOCIAL BLOCKING ---
+// Same social set as the on-device monitor: Snapchat, TikTok, Facebook,
+// Instagram, Threads + their websites. Subdomains match (e.g. m.facebook.com).
+const SOCIAL_DOMAINS = [
+    'facebook.com',
+    'fb.com',
+    'fb.watch',
+    'instagram.com',
+    'tiktok.com',
+    'snapchat.com',
+    'threads.net',
+    'threads.com'
+];
+
+const isSocialHost = (hostname = '') => {
+    const host = String(hostname || '').toLowerCase().split(':')[0].replace(/\.$/, '');
+    if (!host) return false;
+    return SOCIAL_DOMAINS.some(d => host === d || host.endsWith(`.${d}`));
+};
+
+// Parse the queried domain out of a raw DNS query packet (UDP payload).
+// Returns lowercase domain or null if the packet is not a valid query.
+const parseDnsQueryName = (buf) => {
+    try {
+        if (!Buffer.isBuffer(buf) || buf.length < 17) return null;
+        const qdcount = buf.readUInt16BE(4);
+        if (qdcount < 1) return null;
+        let offset = 12;
+        const labels = [];
+        while (offset < buf.length && buf[offset] !== 0) {
+            const len = buf[offset];
+            if (len > 63 || offset + 1 + len > buf.length) return null;
+            labels.push(buf.toString('utf8', offset + 1, offset + 1 + len));
+            offset += 1 + len;
+            if (labels.length > 10) return null;
+        }
+        if (!labels.length) return null;
+        return labels.join('.').toLowerCase();
+    } catch (_) {
+        return null;
+    }
+};
+
+const isSocialBlockedForIp = (ip) => {
+    const user = db.getUserByIp(ip);
+    return Boolean(user && user.social_blocked === true);
+};
+
 // --- MOBILE APP API ---
 
 app.post('/api/register', (req, res) => {
@@ -244,7 +292,8 @@ app.get('/api/status/:device_id', (req, res) => {
         weekly_limit_bytes: weeklyLimitBytes,
         can_connect: getEffectiveUserSpeed(user) > 0,
         pending_notification: user.pending_notification || null,
-        monitoring_enabled: user.monitoring_enabled !== false
+        monitoring_enabled: user.monitoring_enabled !== false,
+        social_blocked: user.social_blocked === true
     });
 });
 
@@ -393,6 +442,15 @@ app.post('/api/admin/toggle_monitoring', adminAuth, (req, res) => {
     }
 });
 
+app.post('/api/admin/toggle_social', adminAuth, (req, res) => {
+    const { id, blocked } = req.body;
+    if (db.setSocialBlocked(id, blocked)) {
+        res.json({ success: true });
+    } else {
+        res.status(400).json({ error: 'User not found' });
+    }
+});
+
 // List recent screenshots for a user (newest first, max 50).
 app.get('/api/admin/screenshots/:id', adminAuth, (req, res) => {
     const user = db.getUserById(req.params.id);
@@ -450,6 +508,12 @@ const proxyServer = http.createServer((req, res) => {
     if (!isLocal && !isAllowed(clientIp)) {
         res.writeHead(403);
         res.end('Forbidden: Not Registered or Quota Exceeded');
+        return;
+    }
+
+    if (!isLocal && isSocialHost(parsedUrl.hostname) && isSocialBlockedForIp(clientIp)) {
+        res.writeHead(403);
+        res.end('Forbidden: Social media blocked for this device');
         return;
     }
 
@@ -613,6 +677,11 @@ proxyServer.on('connect', (req, clientSocket, head) => {
     clientSocket.on('error', () => {});
 
     const { port, hostname } = url.parse(`http://${req.url}`);
+
+    if (isSocialHost(hostname) && isSocialBlockedForIp(clientIp)) {
+        clientSocket.destroy();
+        return;
+    }
     
     try {
         const serverSocket = net.connect(port || 443, hostname, () => {
@@ -782,6 +851,11 @@ const socksServer = net.createServer((clientSocket) => {
 
             const port = reqData.readUInt16BE(portOffset);
 
+            if (isSocialHost(host) && isSocialBlockedForIp(clientIp)) {
+                clientSocket.end();
+                return;
+            }
+
             try {
                 const serverSocket = net.connect(port, host, () => {
                     const reply = Buffer.from([0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
@@ -865,7 +939,18 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
 
             if (message.length < portOffset + 2) return;
             const port = message.readUInt16BE(portOffset);
-                sendRateLimitedUdp(relay, message.subarray(portOffset + 2), port, host, () => getSpeedForIp(clientIp), clientIp);
+            const payload = message.subarray(portOffset + 2);
+            if (isSocialBlockedForIp(clientIp)) {
+                // Direct hostname block (domain-based SOCKS requests).
+                if (isSocialHost(host)) return;
+                // DNS query block: port 53 payloads carry the queried domain.
+                // Dropping social queries breaks apps + web that need resolution.
+                if (port === 53) {
+                    const queried = parseDnsQueryName(payload);
+                    if (queried && isSocialHost(queried)) return;
+                }
+            }
+                sendRateLimitedUdp(relay, payload, port, host, () => getSpeedForIp(clientIp), clientIp);
             return;
         }
 

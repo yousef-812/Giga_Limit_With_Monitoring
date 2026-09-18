@@ -158,6 +158,7 @@ module.exports = {
                     exhausted_speed_limit_bps: null,
                     status: 'active',
                     monitoring_enabled: true,
+                    social_blocked: false,
                     registered_at: getLocalDateString()
                 };
                 data.users.push(user);
@@ -168,6 +169,7 @@ module.exports = {
         }
         if (!user.device_token) user.device_token = generateDeviceToken();
         if (user.monitoring_enabled === undefined) user.monitoring_enabled = true;
+        if (user.social_blocked === undefined) user.social_blocked = false;
         save();
         return user;
     },
@@ -216,6 +218,16 @@ module.exports = {
         let user = data.users.find(u => u.id === parseInt(id));
         if (user) {
             user.monitoring_enabled = enabled === true;
+            save();
+            return true;
+        }
+        return false;
+    },
+
+    setSocialBlocked: (id, blocked) => {
+        let user = data.users.find(u => u.id === parseInt(id));
+        if (user) {
+            user.social_blocked = blocked === true;
             save();
             return true;
         }
