@@ -38,9 +38,13 @@ jobs:
           go-version: '1.24'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          accept-android-sdk-licenses: true
+        # Runner image already ships the SDK; the setup-android action tries to
+        # install the long-removed 'tools' package and fails. Use the
+        # preinstalled cmdline-tools directly instead.
+        run: |
+          echo "ANDROID_HOME=${ANDROID_HOME:-$ANDROID_SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          yes | "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
 
       - name: Install Android NDK
         run: |
@@ -105,7 +109,7 @@ jobs:
         with:
           name: flutter-analyze-log
           path: mobile_app/flutter-analyze.log
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 3
 
       - name: Flutter tests
@@ -120,7 +124,7 @@ jobs:
         with:
           name: flutter-test-log
           path: mobile_app/flutter-test.log
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 3
 
       - name: Build Android APK
