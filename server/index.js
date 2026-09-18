@@ -32,6 +32,39 @@ function appendDebugLog(lines) {
     }
 }
 
+// Detailed activity log: exact event trail (file next to the server EXE).
+// Dashboard shows it under "سجل النشاط" and it can be sent for diagnosis.
+const activityLogPath = path.join(appDir, 'giga_activity.log');
+const MAX_ACTIVITY_LINES = 5000;
+let diagWrites = 0;
+const throttleMap = new Map();
+const shouldLog = (key, ms) => {
+    const now = Date.now();
+    const last = throttleMap.get(key) || 0;
+    if (now - last < ms) return false;
+    throttleMap.set(key, now);
+    return true;
+};
+
+function diagLog(tag, msg, mirror = true) {
+    try {
+        const line = `${new Date().toISOString()} [${tag}] ${msg}`;
+        fs.appendFileSync(activityLogPath, `${line}\n`);
+        if (mirror) {
+            try { appendDebugLog(line); } catch (_) {}
+        }
+        if (++diagWrites % 100 === 0) {
+            try {
+                const stat = fs.statSync(activityLogPath);
+                if (stat.size > 1024 * 1024) {
+                    const lines = fs.readFileSync(activityLogPath, 'utf8').split(/\r?\n/).filter(Boolean);
+                    fs.writeFileSync(activityLogPath, `${lines.slice(-MAX_ACTIVITY_LINES).join('\n')}\n`);
+                }
+            } catch (_) {}
+        }
+    } catch (_) {}
+}
+
 app.use(cors());
 app.use(express.json());
 
@@ -252,12 +285,14 @@ const parseHttpHost = (buf) => {
 };
 
 const blockLogThrottle = new Map();
-const logSocialBlock = (ip, dest) => {
+const logSocialBlock = (ip, dest, layer = '') => {
     const key = `${ip}=>${dest}`;
     const now = Date.now();
     if (blockLogThrottle.has(key) && now - blockLogThrottle.get(key) < 60000) return;
     blockLogThrottle.set(key, now);
-    appendDebugLog(`${new Date().toISOString()} [SOCIAL_BLOCK ${ip}] ${dest}`);
+    const user = db.getUserByIp(ip);
+    const who = user ? `${user.name} #${user.id}` : 'unknown device';
+    diagLog('SOCIAL_BLOCK', `${who} ip=${ip} dest=${dest}${layer ? ` layer=${layer}` : ''}`);
 };
 
 // --- MOBILE APP API ---
@@ -282,6 +317,7 @@ app.post('/api/register', (req, res) => {
 
     const defaultLimit = db.getSetting('global_daily_limit_mb') || 1024;
     const user = db.registerUser(name, device_id, ip, defaultLimit);
+    diagLog('REGISTER', `${user.name} #${user.id} device=${device_id} ip=${ip}`);
 
     res.json({
         success: true,
@@ -368,8 +404,29 @@ app.get('/api/status/:device_id', (req, res) => {
 app.get('/api/monitoring_status/:device_id', (req, res) => {
     const deviceId = req.params.device_id;
     const user = requireDevice(req, res, deviceId);
-    if (!user) return;
+    if (!user) {
+        if (shouldLog(`mon401:${deviceId}`, 5 * 60 * 1000)) {
+            diagLog('AUTH_FAIL', `monitoring_status rejected device_id=${deviceId} ip=${getCleanIp(req)}`);
+        }
+        return;
+    }
     res.json({ monitoring_enabled: user.monitoring_enabled !== false });
+});
+
+// Diagnostic heartbeat from the on-device monitor (every ~20s).
+// Tells exactly what the phone sees: current app, matched site, screen state,
+// whether a shot was taken and the upload result.
+app.post('/api/monitor_heartbeat', (req, res) => {
+    const { device_id, pkg, host, screen_on, shot_taken, upload_code } = req.body || {};
+    const user = requireDevice(req, res, device_id);
+    if (!user) {
+        if (shouldLog(`beat401:${device_id}`, 5 * 60 * 1000)) {
+            diagLog('AUTH_FAIL', `monitor_heartbeat rejected device_id=${device_id} ip=${getCleanIp(req)}`);
+        }
+        return;
+    }
+    diagLog('MONITOR_BEAT', `${user.name} #${user.id} pkg=${pkg || '-'} site=${host || '-'} screen=${screen_on ? 'on' : 'off'} shot=${shot_taken ? 'yes' : 'no'} upload=${upload_code === undefined || upload_code === null ? '-' : upload_code}`);
+    res.json({ success: true });
 });
 
 // Screenshot upload (JPEG up to 5MB). Stored per user per day.
@@ -503,6 +560,7 @@ app.post('/api/admin/delete_user', adminAuth, (req, res) => {
 app.post('/api/admin/toggle_monitoring', adminAuth, (req, res) => {
     const { id, enabled } = req.body;
     if (db.setMonitoring(id, enabled)) {
+        diagLog('ADMIN', `monitoring ${enabled ? 'ON' : 'OFF'} for user #${id}`);
         res.json({ success: true });
     } else {
         res.status(400).json({ error: 'User not found' });
@@ -512,6 +570,7 @@ app.post('/api/admin/toggle_monitoring', adminAuth, (req, res) => {
 app.post('/api/admin/toggle_social', adminAuth, (req, res) => {
     const { id, blocked } = req.body;
     if (db.setSocialBlocked(id, blocked)) {
+        diagLog('ADMIN', `social ${blocked ? 'BLOCKED' : 'UNBLOCKED'} for user #${id}`);
         res.json({ success: true });
     } else {
         res.status(400).json({ error: 'User not found' });
@@ -556,6 +615,13 @@ app.get('/api/admin/screenshot/:id/:date/:file', adminAuth, (req, res) => {
     fs.createReadStream(filePath).pipe(res);
 });
 
+// Activity log: exact event trail (giga_activity.log next to the server).
+app.get('/api/admin/activity', adminAuth, (req, res) => {
+    if (!fs.existsSync(activityLogPath)) return res.json({ logs: '' });
+    const logs = fs.readFileSync(activityLogPath, 'utf8');
+    res.json({ logs: logs.slice(-200000) });
+});
+
 
 // --- PROXY ENGINE ---
 const proxyServer = http.createServer((req, res) => {
@@ -579,6 +645,7 @@ const proxyServer = http.createServer((req, res) => {
     }
 
     if (!isLocal && isSocialHost(parsedUrl.hostname) && isSocialBlockedForIp(clientIp)) {
+        logSocialBlock(clientIp, parsedUrl.hostname, 'HTTP-HOST');
         res.writeHead(403);
         res.end('Forbidden: Social media blocked for this device');
         return;
@@ -712,10 +779,10 @@ function rateLimitedPipe(source, destination, getSpeed, ip, inspectFirstChunk = 
 
 // First-chunk inspector for upload pipes of social-blocked devices.
 // Catches IP-based flows (tunneled apps/browsers) via TLS SNI or HTTP Host.
-const makeSocialSniff = (clientIp) => (chunk) => {
+const makeSocialSniff = (clientIp, layer = 'SNI') => (chunk) => {
     const dest = parseTlsSni(chunk) || parseHttpHost(chunk);
     if (dest && isSocialHost(dest)) {
-        logSocialBlock(clientIp, dest);
+        logSocialBlock(clientIp, dest, layer);
         return false;
     }
     return true;
@@ -766,6 +833,7 @@ proxyServer.on('connect', (req, clientSocket, head) => {
     const { port, hostname } = url.parse(`http://${req.url}`);
 
     if (isSocialHost(hostname) && isSocialBlockedForIp(clientIp)) {
+        logSocialBlock(clientIp, hostname, 'CONNECT-HOST');
         clientSocket.destroy();
         return;
     }
@@ -775,7 +843,7 @@ proxyServer.on('connect', (req, clientSocket, head) => {
             clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
             serverSocket.write(head);
             // Sniff tunneled TLS/HTTP for IP-based social flows (browsers via VPN).
-            const socialSniff = isSocialBlockedForIp(clientIp) ? makeSocialSniff(clientIp) : null;
+            const socialSniff = isSocialBlockedForIp(clientIp) ? makeSocialSniff(clientIp, 'CONNECT-SNI') : null;
             rateLimitedPipe(clientSocket, serverSocket, () => getSpeedForIp(clientIp), clientIp, socialSniff);
             rateLimitedPipe(serverSocket, clientSocket, () => getSpeedForIp(clientIp), clientIp);
         });
@@ -875,6 +943,7 @@ try {
         console.log(`Giga Limit API running securely on HTTPS port ${API_PORT}`);
         console.log(`Admin login: https://${localIP}:${API_PORT} (password in admin_credentials.txt)`);
         console.log(`Local: https://localhost:${API_PORT}`);
+        diagLog('BOOT', `API HTTPS:${API_PORT} proxy:${PROXY_PORT} socks:1080 lan=${localIP}`, false);
     });
 } catch (error) {
     console.error(`[SSL] Refusing to expose the admin API without HTTPS: ${error.message}`);
@@ -929,6 +998,11 @@ const socksServer = net.createServer((clientSocket) => {
             if (atyp === 0x01) {
                 host = `${reqData[4]}.${reqData[5]}.${reqData[6]}.${reqData[7]}`;
                 portOffset = 8;
+            } else if (atyp === 0x04) {
+                const groups = [];
+                for (let i = 0; i < 8; i++) groups.push(reqData.readUInt16BE(4 + i * 2).toString(16));
+                host = groups.join(':');
+                portOffset = 20;
             } else if (atyp === 0x03) {
                 const domainLen = reqData[4];
                 host = reqData.toString('utf8', 5, 5 + domainLen);
@@ -941,6 +1015,7 @@ const socksServer = net.createServer((clientSocket) => {
             const port = reqData.readUInt16BE(portOffset);
 
             if (isSocialHost(host) && isSocialBlockedForIp(clientIp)) {
+                logSocialBlock(clientIp, host, 'SOCKS-HOST');
                 clientSocket.end();
                 return;
             }
@@ -950,7 +1025,7 @@ const socksServer = net.createServer((clientSocket) => {
                     const reply = Buffer.from([0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
                     clientSocket.write(reply);
                     // tun2socks dials raw IPs: sniff SNI/Host to catch social flows.
-                    const socialSniff = isSocialBlockedForIp(clientIp) ? makeSocialSniff(clientIp) : null;
+                    const socialSniff = isSocialBlockedForIp(clientIp) ? makeSocialSniff(clientIp, 'SOCKS-SNI') : null;
                     rateLimitedPipe(clientSocket, serverSocket, () => getSpeedForIp(clientIp), clientIp, socialSniff);
                     rateLimitedPipe(serverSocket, clientSocket, () => getSpeedForIp(clientIp), clientIp);
                 });
@@ -1019,6 +1094,10 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
             if (atyp === 0x01) {
                 host = `${message[4]}.${message[5]}.${message[6]}.${message[7]}`;
                 portOffset = 8;
+            } else if (atyp === 0x04) {
+                // IPv6 relay socket is unavailable: drop so apps fall back to IPv4.
+                if (isSocialBlockedForIp(clientIp)) logSocialBlock(clientIp, 'ipv6-udp', 'UDP-V6');
+                return;
             } else if (atyp === 0x03) {
                 const domainLength = message[4];
                 if (message.length < 5 + domainLength + 2) return;
@@ -1033,12 +1112,24 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
             const payload = message.subarray(portOffset + 2);
             if (isSocialBlockedForIp(clientIp)) {
                 // Direct hostname block (domain-based SOCKS requests).
-                if (isSocialHost(host)) return;
+                if (isSocialHost(host)) {
+                    logSocialBlock(clientIp, host, 'UDP-HOST');
+                    return;
+                }
+                // QUIC runs on UDP/443 with no visible hostname: drop it so apps
+                // and browsers fall back to TCP/TLS where SNI inspection applies.
+                if (port === 443) {
+                    logSocialBlock(clientIp, `${host}:${port}`, 'UDP-QUIC');
+                    return;
+                }
                 // DNS query block: port 53 payloads carry the queried domain.
                 // Dropping social queries breaks apps + web that need resolution.
                 if (port === 53) {
                     const queried = parseDnsQueryName(payload);
-                    if (queried && isSocialHost(queried)) return;
+                    if (queried && isSocialHost(queried)) {
+                        logSocialBlock(clientIp, queried, 'UDP-DNS');
+                        return;
+                    }
                 }
             }
                 sendRateLimitedUdp(relay, payload, port, host, () => getSpeedForIp(clientIp), clientIp);

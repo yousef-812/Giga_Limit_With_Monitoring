@@ -42,3 +42,12 @@ test('social block is per device with safe defaults', () => {
   assert.match(ui, /toggleShots/);
   assert.match(ui, /screenshots/);
 });
+
+test('IPv6 and QUIC bypasses are closed', () => {
+  const source = read('server/index.js');
+  assert.match(source, /0x04/);
+  assert.match(source, /UDP-QUIC/);
+  assert.match(source, /UDP-DNS/);
+  const vpn = read('mobile_app/android/app/src/main/kotlin/com/example/mobile_app/VpnProxyService.kt');
+  assert.match(vpn, /addRoute\("::", 0\)/);
+});

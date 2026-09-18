@@ -55,3 +55,18 @@ test('monitoring defaults on and can be toggled per user', () => {
   assert.match(ui, /toggleMonitoring/);
   assert.match(ui, /toggle_monitoring/);
 });
+
+test('diagnostic heartbeat and activity log are wired', () => {
+  const source = read('server/index.js');
+  assert.match(source, /monitor_heartbeat/);
+  assert.match(source, /MONITOR_BEAT/);
+  assert.match(source, /giga_activity\.log/);
+  assert.match(source, /\/api\/admin\/activity/);
+  assert.match(source, /AUTH_FAIL/);
+  const kotlin = read('mobile_app/android/app/src/main/kotlin/com/example/mobile_app/ScreenMonitorService.kt');
+  assert.match(kotlin, /monitor_heartbeat/);
+  assert.match(kotlin, /sendHeartbeat/);
+  const ui = read('server/public/index.html');
+  assert.match(ui, /loadActivity/);
+  assert.match(ui, /downloadActivity/);
+});

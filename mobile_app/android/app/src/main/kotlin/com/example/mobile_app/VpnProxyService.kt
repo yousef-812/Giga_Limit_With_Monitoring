@@ -133,7 +133,11 @@ class VpnProxyService : VpnService() {
         val builder = Builder()
         builder.setSession("Giga Limit")
         builder.addAddress("10.0.0.2", 32)
+        // Capture IPv6 too: without a ::/0 route, social apps escape over IPv6.
+        // IPv6 packets enter the tunnel and fall back to inspected IPv4 paths.
+        try { builder.addAddress("fd00::2", 64) } catch (_: Exception) {}
         builder.addRoute("0.0.0.0", 0)
+        try { builder.addRoute("::", 0) } catch (_: Exception) {}
         builder.addDnsServer("8.8.8.8")
         builder.addDnsServer("8.8.4.4")
         builder.setMtu(1500)
