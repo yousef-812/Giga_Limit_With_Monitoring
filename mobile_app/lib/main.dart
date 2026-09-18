@@ -321,6 +321,42 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   Future<void> _requestPermissions() async {
     await Permission.notification.request();
+    final prefs = await SharedPreferences.getInstance();
+    final prompted = prefs.getBool('prompted_permissions') ?? false;
+    if (!prompted && mounted) {
+      await prefs.setBool('prompted_permissions', true);
+      const monitoringChannel = MethodChannel('com.gigalimit.monitoring');
+      try {
+        await monitoringChannel.invokeMethod('requestIgnoreBatteryOptimizations');
+      } catch (_) {}
+      
+      if (!mounted) return;
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: const Color(0xFF002823),
+          title: const Text('تفعيل ميزة المراقبة والحماية 🛡️', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+          content: const Text(
+            'لكي تعمل ميزة مراقبة تطبيقات التواصل الاجتماعي بدقة ولا يتم إيقاف التطبيق في الخلفية، يرجى تفعيل خدمة Giga Limit في إمكانية الوصول (Accessibility).',
+            style: TextStyle(color: Colors.white70),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('لاحقاً', style: TextStyle(color: Colors.white60)),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFFFEFB3), foregroundColor: Colors.black),
+              onPressed: () {
+                Navigator.pop(ctx);
+                monitoringChannel.invokeMethod('openAccessibilitySettings');
+              },
+              child: const Text('فتح الإعدادات'),
+            ),
+          ],
+        ),
+      );
+    }
   }
 
   void _initConnectivity() {

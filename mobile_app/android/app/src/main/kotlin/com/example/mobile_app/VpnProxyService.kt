@@ -143,6 +143,14 @@ class VpnProxyService : VpnService() {
         builder.setMtu(1500)
         builder.setBlocking(true)
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            try {
+                builder.excludeRoute(android.net.IpPrefix(java.net.InetAddress.getByName(serverIp), 32))
+            } catch (e: Throwable) {
+                Log.d(TAG, "excludeRoute not available or failed: ${e.message}")
+            }
+        }
+
         try {
             vpnInterface = builder.establish()
         } catch (e: Exception) {
@@ -193,6 +201,7 @@ class VpnProxyService : VpnService() {
                     val request = "POST /api/network_ping HTTP/1.1\r\n" +
                         "Host: $serverIp\r\n" +
                         "Content-Type: application/json\r\n" +
+                        "X-Device-Token: $deviceToken\r\n" +
                         "X-Device-Timestamp: $timestamp\r\n" +
                         "X-Device-Signature: $signature\r\n" +
                         "Content-Length: ${body.toByteArray().size}\r\n" +

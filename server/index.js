@@ -159,11 +159,12 @@ const verifyNetworkSignature = (deviceId, timestamp, signature) => {
     const user = db.getUserByDeviceId(deviceId);
     const timestampNumber = Number(timestamp);
     if (!user || !user.device_token || !Number.isFinite(timestampNumber) || typeof signature !== 'string') return false;
-    if (Math.abs(Date.now() - timestampNumber) > 30_000) return false;
+    // Tolerate up to 5 minutes clock drift between mobile and server
+    if (Math.abs(Date.now() - timestampNumber) > 300_000) return false;
 
     const now = Date.now();
     for (const [usedSignature, usedAt] of usedNetworkSignatures) {
-        if (now - usedAt > 60_000) usedNetworkSignatures.delete(usedSignature);
+        if (now - usedAt > 600_000) usedNetworkSignatures.delete(usedSignature);
     }
     if (usedNetworkSignatures.has(signature)) return false;
 
@@ -180,17 +181,37 @@ const verifyNetworkSignature = (deviceId, timestamp, signature) => {
 };
 
 // --- SOCIAL BLOCKING ---
-// Same social set as the on-device monitor: Snapchat, TikTok, Facebook,
-// Instagram, Threads + their websites. Subdomains match (e.g. m.facebook.com).
+// Comprehensive list of social platforms and their essential media CDNs
 const SOCIAL_DOMAINS = [
+    // Facebook & Messenger & Meta
     'facebook.com',
     'fb.com',
     'fb.watch',
+    'fbcdn.net',
+    'fbsbx.com',
+    'messenger.com',
+    'meta.com',
+    // Instagram & Threads
     'instagram.com',
-    'tiktok.com',
-    'snapchat.com',
+    'cdninstagram.com',
     'threads.net',
-    'threads.com'
+    'threads.com',
+    'instagr.am',
+    // TikTok & ByteDance
+    'tiktok.com',
+    'tiktokcdn.com',
+    'tiktokv.com',
+    'byteoversea.com',
+    'ibytedtos.com',
+    'musical.ly',
+    'muscdn.com',
+    'ttwstatic.com',
+    // Snapchat
+    'snapchat.com',
+    'sc-cdn.net',
+    'snapkit.com',
+    'snapads.com',
+    'snap-dev.net'
 ];
 
 const isSocialHost = (hostname = '') => {
@@ -335,18 +356,23 @@ const handleNetworkPing = (req, res) => {
     const { device_id } = req.body;
     const timestamp = req.headers['x-device-timestamp'];
     const signature = req.headers['x-device-signature'];
+    const token = req.headers['x-device-token'];
     const ip = getCleanIp(req);
-
-    if (!verifyNetworkSignature(device_id, timestamp, signature)) {
-        return res.status(401).json({ error: 'Invalid or replayed network signature' });
-    }
 
     const user = db.getUserByDeviceId(device_id);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
+    const isTokenValid = token && db.verifyDeviceToken(device_id, token);
+    const isSigValid = timestamp && signature && verifyNetworkSignature(device_id, timestamp, signature);
+
+    if (!isTokenValid && !isSigValid) {
+        diagLog('PING_REJECT', `Rejected ping for ${user.name} #${user.id} from ip=${ip}`);
+        return res.status(401).json({ error: 'Invalid or replayed network signature' });
+    }
+
     if (user.current_ip !== ip) {
         db.updateUserIp(device_id, ip);
-        appendDebugLog(`${new Date().toISOString()} [NETWORK_PING ${user.name} #${user.id}] ${ip}`);
+        diagLog('IP_CHANGE', `${user.name} #${user.id} IP updated to ${ip}`);
     }
     res.json({ success: true, registered_ip: ip });
 };
@@ -429,8 +455,8 @@ app.post('/api/monitor_heartbeat', (req, res) => {
     res.json({ success: true });
 });
 
-// Screenshot upload (JPEG up to 5MB). Stored per user per day.
-app.post('/api/upload_screenshot', express.raw({ type: 'image/jpeg', limit: '5mb' }), (req, res) => {
+// Screenshot upload (JPEG up to 5MB). Stored per user per day asynchronously.
+app.post('/api/upload_screenshot', express.raw({ type: 'image/jpeg', limit: '5mb' }), async (req, res) => {
     const deviceId = req.headers['x-device-id'];
     const user = requireDevice(req, res, deviceId);
     if (!user) return;
@@ -444,15 +470,16 @@ app.post('/api/upload_screenshot', express.raw({ type: 'image/jpeg', limit: '5mb
     const safeName = String(user.name || `device_${user.id}`).replace(/[\\/:*?"<>|]/g, '_').slice(0, 60) || `device_${user.id}`;
     const today = db.getLocalDateString();
     const dir = path.join(appDir, 'screenshots', `${safeName}_${user.id}`, today);
-    try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
-    const filePath = path.join(dir, `${Date.now()}.jpg`);
     try {
-        fs.writeFileSync(filePath, req.body);
+        await fs.promises.mkdir(dir, { recursive: true });
+        const filePath = path.join(dir, `${Date.now()}.jpg`);
+        await fs.promises.writeFile(filePath, req.body);
+        diagLog('SCREENSHOT', `${user.name} #${user.id} saved ${filePath} (${req.body.length} bytes)`);
+        res.json({ success: true });
     } catch (e) {
-        return res.status(500).json({ error: 'Could not save screenshot' });
+        diagLog('SCREENSHOT_ERR', `${user.name} #${user.id} save failed: ${e.message}`);
+        res.status(500).json({ error: 'Could not save screenshot' });
     }
-    appendDebugLog(`${new Date().toISOString()} [SCREENSHOT ${user.name} #${user.id}] ${filePath} (${req.body.length} bytes)`);
-    res.json({ success: true });
 });
 
 // --- ADMIN API ---
@@ -794,10 +821,12 @@ function sendRateLimitedUdp(socket, message, port, host, getSpeed, ip) {
     const bytesPerSecond = getSpeed();
     if (bytesPerSecond <= 0) return;
     const send = () => { try { socket.send(message, port, host); } catch (_) {} };
-    if (bytesPerSecond === Infinity || !bytesPerSecond) return send();
+    // Always permit DNS lookups instantly without delay to avoid network stall
+    if (port === 53 || bytesPerSecond === Infinity || !bytesPerSecond) return send();
     const bucket = getBucket(ip);
     const delay = consumeTokens(bucket, message.length, bytesPerSecond);
     if (delay <= 0) return send();
+    if (delay > 1500) return; // Drop excessive UDP burst to prevent memory/timer bloat
     setTimeout(send, Math.ceil(delay));
 }
 
@@ -826,6 +855,7 @@ proxyServer.on('connect', (req, clientSocket, head) => {
     if (clientIp.includes('::ffff:')) clientIp = clientIp.split('::ffff:')[1];
 
     if (!isAllowed(clientIp)) {
+        clientSocket.destroy();
         return;
     }
 
@@ -864,8 +894,8 @@ proxyServer.on('connect', (req, clientSocket, head) => {
                 bytesTransferred = 0;
             }
             if (!isAllowed(clientIp)) {
-                clientSocket.pause();
-                if (serverSocket) serverSocket.pause();
+                clientSocket.destroy();
+                if (serverSocket) serverSocket.destroy();
             }
         };
 
@@ -1062,8 +1092,8 @@ const socksServer = net.createServer((clientSocket) => {
                         bytesTransferred = 0;
                     }
                     if (!isAllowed(clientIp)) {
-                        clientSocket.pause();
-                        if (serverSocket) serverSocket.pause();
+                        clientSocket.destroy();
+                        if (serverSocket) serverSocket.destroy();
                     }
                 };
 

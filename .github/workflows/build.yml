@@ -1,6 +1,8 @@
 name: Build and Test GigaLimit
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -137,15 +139,24 @@ jobs:
         working-directory: server
         run: npm run build:exe
 
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: GigaLimit-Binaries
+          path: |
+            mobile_app/build/app/outputs/flutter-apk/GigaLimit_App.apk
+            server/GigaLimit_Server.exe
+          retention-days: 14
+
       - name: Create release tag
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
         run: |
           TAG="v1.0.0-${{ github.run_number }}"
           git tag "$TAG"
-          git push origin "$TAG"
+          git push origin "$TAG" || true
 
       - name: Release matching server and app
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.0-${{ github.run_number }}
