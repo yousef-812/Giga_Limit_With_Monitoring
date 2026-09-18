@@ -789,9 +789,11 @@ const makeSocialSniff = (clientIp, layer = 'SNI') => (chunk) => {
 };
 
 function sendRateLimitedUdp(socket, message, port, host, getSpeed, ip) {
+    if (!socket || !message || !message.length || !host) return;
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) return;
     const bytesPerSecond = getSpeed();
     if (bytesPerSecond <= 0) return;
-    const send = () => socket.send(message, port, host);
+    const send = () => { try { socket.send(message, port, host); } catch (_) {} };
     if (bytesPerSecond === Infinity || !bytesPerSecond) return send();
     const bucket = getBucket(ip);
     const delay = consumeTokens(bucket, message.length, bytesPerSecond);
@@ -995,16 +997,28 @@ const socksServer = net.createServer((clientSocket) => {
             let host;
             let portOffset;
 
+            if (reqData.length < 10) {
+                clientSocket.end();
+                return;
+            }
             if (atyp === 0x01) {
                 host = `${reqData[4]}.${reqData[5]}.${reqData[6]}.${reqData[7]}`;
                 portOffset = 8;
             } else if (atyp === 0x04) {
+                if (reqData.length < 22) {
+                    clientSocket.end();
+                    return;
+                }
                 const groups = [];
                 for (let i = 0; i < 8; i++) groups.push(reqData.readUInt16BE(4 + i * 2).toString(16));
                 host = groups.join(':');
                 portOffset = 20;
             } else if (atyp === 0x03) {
                 const domainLen = reqData[4];
+                if (!domainLen || reqData.length < 5 + domainLen + 2) {
+                    clientSocket.end();
+                    return;
+                }
                 host = reqData.toString('utf8', 5, 5 + domainLen);
                 portOffset = 5 + domainLen;
             } else {
@@ -1013,6 +1027,10 @@ const socksServer = net.createServer((clientSocket) => {
             }
 
             const port = reqData.readUInt16BE(portOffset);
+            if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+                clientSocket.end();
+                return;
+            }
 
             if (isSocialHost(host) && isSocialBlockedForIp(clientIp)) {
                 logSocialBlock(clientIp, host, 'SOCKS-HOST');
@@ -1109,7 +1127,10 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
 
             if (message.length < portOffset + 2) return;
             const port = message.readUInt16BE(portOffset);
+            // Drop keepalives/empty headers (port 0) instead of crashing the send.
+            if (!Number.isInteger(port) || port <= 0 || port > 65535) return;
             const payload = message.subarray(portOffset + 2);
+            if (!payload.length) return;
             if (isSocialBlockedForIp(clientIp)) {
                 // Direct hostname block (domain-based SOCKS requests).
                 if (isSocialHost(host)) {
@@ -1192,31 +1213,39 @@ $block | Out-Null;
     const scriptPath = path.join(appDir, 'hotspot_block.ps1');
     fs.writeFileSync(scriptPath, blockScript);
 
+    // Setup script uses proper ScheduledTask objects (the old inline
+    // Register-ScheduledTask call passed invalid loose arguments and always failed).
+    const setupScript = [
+        `Unregister-ScheduledTask -TaskName '${taskName}' -Confirm:$false -ErrorAction SilentlyContinue`,
+        `$action = New-ScheduledTaskAction -Execute 'powershell' -Argument '-NoProfile -WindowStyle Hidden -File ''${scriptPath.replace(/'/g, "''")}'''`,
+        `$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)`,
+        `$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -DontStopOnIdleEnd`,
+        `$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest`,
+        `Register-ScheduledTask -TaskName '${taskName}' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null`,
+        `Write-Output 'HOTSPOT_TASK_OK'`
+    ].join('\r\n');
+    const setupPath = path.join(appDir, 'hotspot_setup.ps1');
+    fs.writeFileSync(setupPath, setupScript);
+
     function setupHotspotBlocker() {
         try {
-            execSync(`powershell -Command "Unregister-ScheduledTask -TaskName '${taskName}' -Confirm:$false -ErrorAction SilentlyContinue"`, { stdio: 'ignore', timeout: 8000 });
-        } catch (_) {}
-
-        try {
-            const action = `-Action Execute -Argument '-NoProfile -WindowStyle Hidden -File "${scriptPath}"' -FilePath powershell`;
-            const trigger = `-Once -At (Get-Date).AddSeconds(2) -RepetitionInterval (New-TimeSpan -Seconds 10) -RepetitionDuration (New-TimeSpan -Days 3650)`;
-            const settings = `-Settings AllowStartIfOnBatteries -StartWhenAvailable -DontStopOnIdleEnd`;
-            const principal = `-Principal $env:USERNAME -RunLevel Highest`;
-            const cmd = `Register-ScheduledTask -TaskName '${taskName}' ${action} ${trigger} ${settings} ${principal} -Force`;
-            execSync(`powershell -Command "${cmd.replace(/"/g, '\\"')}"`, { stdio: 'ignore', timeout: 15000 });
-            console.log('[HOTSPOT] Scheduled task created - hotspot blocker active');
-            return true;
+            const out = execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${setupPath}"`, { timeout: 20000 });
+            if (String(out).includes('HOTSPOT_TASK_OK')) {
+                console.log('[HOTSPOT] Scheduled task created - hotspot blocker active');
+                return true;
+            }
+            throw new Error('setup script did not confirm');
         } catch (e) {
             console.log('[HOTSPOT] Could not create scheduled task:', e.message);
             return false;
         }
     }
 
-    function runOnceElevated() {
+    function runSetupElevated() {
         try {
-            const cmd = `Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -WindowStyle Hidden -File "${scriptPath}"' -Wait -WindowStyle Hidden`;
-            execSync(`powershell -Command "${cmd.replace(/"/g, '\\"')}"`, { stdio: 'ignore', timeout: 20000 });
-            console.log('[HOTSPOT] First run executed with admin privileges');
+            const cmd = `Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File "${setupPath}"' -Wait -WindowStyle Hidden`;
+            execSync(`powershell -Command "${cmd.replace(/"/g, '\\"')}"`, { stdio: 'ignore', timeout: 30000 });
+            console.log('[HOTSPOT] Elevated setup executed with admin privileges');
             return true;
         } catch (_) {
             return false;
@@ -1233,7 +1262,7 @@ $block | Out-Null;
         setupHotspotBlocker();
     } else {
         console.log('[HOTSPOT] Requesting admin for initial setup...');
-        if (runOnceElevated()) {
+        if (runSetupElevated()) {
             setupHotspotBlocker();
         } else {
             console.log('[HOTSPOT] Admin denied - hotspot blocker disabled. Right-click the EXE > Run as administrator.');
@@ -1242,7 +1271,7 @@ $block | Out-Null;
 }
 
 process.on('uncaughtException', (err) => {
-    if (err.code === 'ECONNRESET' || err.code === 'EPIPE' || err.code === 'ETIMEDOUT') {
+    if (err.code === 'ECONNRESET' || err.code === 'EPIPE' || err.code === 'ETIMEDOUT' || err.code === 'ERR_SOCKET_BAD_PORT') {
         return;
     }
     console.error('Unhandled Exception:', err);
