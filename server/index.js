@@ -49,6 +49,7 @@ const shouldLog = (key, ms) => {
 function diagLog(tag, msg, mirror = true) {
     try {
         const line = `${new Date().toISOString()} [${tag}] ${msg}`;
+        console.log(line);
         fs.appendFileSync(activityLogPath, `${line}\n`);
         if (mirror) {
             try { appendDebugLog(line); } catch (_) {}
@@ -999,12 +1000,17 @@ proxyServer.listen(PROXY_PORT, '0.0.0.0', () => {
 const socksServer = net.createServer((clientSocket) => {
     let clientIp = db.normalizeIp ? db.normalizeIp(clientSocket.remoteAddress) : (clientSocket.remoteAddress || '').replace(/^::ffff:/, '').trim();
 
+    diagLog('SOCKS5:CONNECT', `Incoming connection from client: ${clientIp}`);
+
     if (!isAllowed(clientIp)) {
+        diagLog('SOCKS5:REJECT', `Client ${clientIp} rejected by isAllowed (not registered, speed 0, or blocked)`);
         clientSocket.destroy();
         return;
     }
 
-    clientSocket.on('error', () => {});
+    clientSocket.on('error', (e) => {
+        diagLog('SOCKS5:ERR', `Client ${clientIp} socket error: ${e.message}`);
+    });
 
     let state = 'AUTH'; // AUTH -> REQUEST -> TUNNEL
     let buffer = Buffer.alloc(0);
@@ -1020,6 +1026,7 @@ const socksServer = net.createServer((clientSocket) => {
         if (state === 'AUTH') {
             if (buffer.length < 2) return;
             if (buffer[0] !== 0x05) {
+                diagLog('SOCKS5:AUTH_FAIL', `Invalid SOCKS version 0x${buffer[0].toString(16)} from ${clientIp}`);
                 clientSocket.destroy();
                 return;
             }
@@ -1039,6 +1046,7 @@ const socksServer = net.createServer((clientSocket) => {
         if (state === 'REQUEST') {
             if (buffer.length < 4) return;
             if (buffer[0] !== 0x05) {
+                diagLog('SOCKS5:REQ_FAIL', `Invalid SOCKS request version 0x${buffer[0].toString(16)} from ${clientIp}`);
                 clientSocket.destroy();
                 return;
             }
@@ -1046,11 +1054,13 @@ const socksServer = net.createServer((clientSocket) => {
             const cmd = buffer[1];
             if (cmd === 0x03) { // UDP ASSOCIATE
                 clientSocket.removeListener('data', onData);
+                diagLog('SOCKS5:UDP_ASSOC_REQ', `Client ${clientIp} requested UDP Association`);
                 handleSocksUdpAssociation(clientSocket, clientIp);
                 return;
             }
 
             if (cmd !== 0x01) { // CONNECT only
+                diagLog('SOCKS5:UNSUPPORTED_CMD', `Client ${clientIp} requested command 0x${cmd.toString(16)}`);
                 clientSocket.destroy();
                 return;
             }
@@ -1075,6 +1085,7 @@ const socksServer = net.createServer((clientSocket) => {
                 host = buffer.toString('utf8', 5, 5 + domainLen);
                 portOffset = 5 + domainLen;
             } else {
+                diagLog('SOCKS5:UNKNOWN_ATYP', `Client ${clientIp} sent unknown atyp 0x${atyp.toString(16)}`);
                 clientSocket.destroy();
                 return;
             }
@@ -1082,6 +1093,7 @@ const socksServer = net.createServer((clientSocket) => {
             if (buffer.length < portOffset + 2) return;
             const port = buffer.readUInt16BE(portOffset);
             if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+                diagLog('SOCKS5:INVALID_PORT', `Client ${clientIp} invalid port ${port}`);
                 clientSocket.destroy();
                 return;
             }
@@ -1090,14 +1102,18 @@ const socksServer = net.createServer((clientSocket) => {
             clientSocket.removeListener('data', onData);
             state = 'TUNNEL';
 
+            diagLog('SOCKS5:DIAL', `Client ${clientIp} -> ${host}:${port} (pipelined bytes: ${remainingData.length})`);
+
             if (isSocialHost(host) && isSocialBlockedForIp(clientIp)) {
                 logSocialBlock(clientIp, host, 'SOCKS-HOST');
+                diagLog('SOCKS5:SOCIAL_BLOCKED', `Blocked social host ${host} for client ${clientIp}`);
                 clientSocket.destroy();
                 return;
             }
 
             try {
                 const serverSocket = net.connect(port, host, () => {
+                    diagLog('SOCKS5:ESTABLISHED', `Tunnel open: ${clientIp} <-> ${host}:${port}`);
                     const reply = Buffer.from([0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
                     clientSocket.write(reply);
 
@@ -1105,6 +1121,7 @@ const socksServer = net.createServer((clientSocket) => {
 
                     if (remainingData.length > 0) {
                         if (socialSniff && !socialSniff(remainingData)) {
+                            diagLog('SOCKS5:SNIFF_BLOCKED', `Blocked social SNI in pipelined data for ${clientIp}`);
                             clientSocket.destroy();
                             serverSocket.destroy();
                             return;
@@ -1130,6 +1147,7 @@ const socksServer = net.createServer((clientSocket) => {
                         bytesTransferred = 0;
                     }
                     if (!isAllowed(clientIp)) {
+                        diagLog('SOCKS5:QUOTA_CUT', `Terminating tunnel for ${clientIp} due to quota exhaustion`);
                         clientSocket.destroy();
                         if (serverSocket) serverSocket.destroy();
                     }
@@ -1140,16 +1158,20 @@ const socksServer = net.createServer((clientSocket) => {
                 const onEnd = () => {
                     clearInterval(interval);
                     saveStats();
+                    diagLog('SOCKS5:CLOSED', `Tunnel closed: ${clientIp} <-> ${host}:${port}`);
                 };
 
                 serverSocket.on('end', onEnd);
                 clientSocket.on('end', onEnd);
-                serverSocket.on('error', () => clientSocket.destroy());
+                serverSocket.on('error', (err) => {
+                    diagLog('SOCKS5:REMOTE_ERR', `Remote ${host}:${port} error for ${clientIp}: ${err.message}`);
+                    clientSocket.destroy();
+                });
                 clientSocket.on('error', () => {
                     if (serverSocket) serverSocket.destroy();
                 });
             } catch (err) {
-                console.error('Invalid SOCKS5 Request:', err.message);
+                diagLog('SOCKS5:CONNECT_EX', `Connection exception to ${host}:${port} for ${clientIp}: ${err.message}`);
                 clientSocket.destroy();
             }
         }
@@ -1167,10 +1189,17 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
     clientSocket.once('close', closeRelay);
     clientSocket.once('error', closeRelay);
 
-    relay.on('error', closeRelay);
+    relay.on('error', (err) => {
+        diagLog('UDP:RELAY_ERR', `UDP relay error for client ${clientIp}: ${err.message}`);
+        closeRelay();
+    });
+
     relay.on('message', (message, rinfo) => {
+        const normRinfo = db.normalizeIp ? db.normalizeIp(rinfo.address) : rinfo.address;
+        const normClient = db.normalizeIp ? db.normalizeIp(clientIp) : clientIp;
+
         // The first UDP packet identifies the source port selected by the client.
-        if (rinfo.address === clientIp && (clientUdpPort === null || rinfo.port === clientUdpPort)) {
+        if (normRinfo === normClient && (clientUdpPort === null || rinfo.port === clientUdpPort)) {
             clientUdpPort = rinfo.port;
             if (message.length < 10 || message[0] !== 0 || message[1] !== 0 || message[2] !== 0) return;
 
@@ -1197,22 +1226,26 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
             if (!Number.isInteger(port) || port <= 0 || port > 65535) return;
             const payload = message.subarray(portOffset + 2);
             if (!payload.length) return;
-            if (isSocialBlockedForIp(clientIp)) {
-                // Direct hostname block (domain-based SOCKS requests).
-                if (isSocialHost(host)) {
-                    logSocialBlock(clientIp, host, 'UDP-HOST');
+
+            if (port === 53) {
+                const queried = parseDnsQueryName(payload);
+                diagLog('UDP:DNS_QUERY', `Client ${clientIp} -> queried DNS: ${queried || host}`);
+                if (isSocialBlockedForIp(clientIp) && queried && isSocialHost(queried)) {
+                    logSocialBlock(clientIp, queried, 'UDP-DNS');
+                    diagLog('UDP:DNS_BLOCKED', `Blocked social DNS query ${queried} for ${clientIp}`);
                     return;
                 }
-                // QUIC runs on UDP/443 for social hosts:
-                if (port === 443 && isSocialHost(host)) {
-                    logSocialBlock(clientIp, `${host}:${port}`, 'UDP-QUIC');
-                    return;
-                }
-                // DNS query block: port 53 payloads carry the queried domain.
-                if (port === 53) {
-                    const queried = parseDnsQueryName(payload);
-                    if (queried && isSocialHost(queried)) {
-                        logSocialBlock(clientIp, queried, 'UDP-DNS');
+            } else {
+                diagLog('UDP:SEND', `Client ${clientIp} -> UDP ${host}:${port} (${payload.length}B)`);
+                if (isSocialBlockedForIp(clientIp)) {
+                    if (isSocialHost(host)) {
+                        logSocialBlock(clientIp, host, 'UDP-HOST');
+                        diagLog('UDP:HOST_BLOCKED', `Blocked social host ${host} on UDP for ${clientIp}`);
+                        return;
+                    }
+                    if (port === 443 && isSocialHost(host)) {
+                        logSocialBlock(clientIp, `${host}:${port}`, 'UDP-QUIC');
+                        diagLog('UDP:QUIC_BLOCKED', `Blocked social QUIC ${host}:${port} for ${clientIp}`);
                         return;
                     }
                 }
@@ -1221,7 +1254,7 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
             return;
         }
 
-        if (clientUdpPort === null || rinfo.address === clientIp) return;
+        if (clientUdpPort === null || normRinfo === normClient) return;
         const octets = rinfo.address.split('.').map(Number);
         if (octets.length !== 4 || octets.some(Number.isNaN)) return;
         const header = Buffer.from([
@@ -1229,6 +1262,7 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
             ...octets,
             rinfo.port >> 8, rinfo.port & 0xff
         ]);
+        diagLog('UDP:REPLY', `Relaying remote UDP response from ${rinfo.address}:${rinfo.port} -> ${clientIp}:${clientUdpPort}`);
         sendRateLimitedUdp(relay, Buffer.concat([header, message]), clientUdpPort, clientIp, () => getSpeedForIp(clientIp), clientIp);
     });
 
@@ -1238,6 +1272,7 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
         if (localIp.startsWith('::ffff:')) localIp = localIp.substring(7);
         const octets = localIp.split('.').map(Number);
         const replyIp = octets.length === 4 && octets.every(Number.isFinite) ? octets : [0, 0, 0, 0];
+        diagLog('UDP:BOUND', `UDP relay bound on port ${relayPort} for client ${clientIp}`);
         clientSocket.write(Buffer.from([
             0x05, 0x00, 0x00, 0x01,
             ...replyIp,

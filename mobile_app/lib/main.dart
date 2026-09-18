@@ -488,6 +488,97 @@ class _DashboardScreenState extends State<DashboardScreen> {
     Future.delayed(const Duration(seconds: 5), _fetchStats); // Auto refresh
   }
 
+  Future<void> _showLogDialog() async {
+    List<dynamic> logs = [];
+    try {
+      final res = await _vpnChannel.invokeMethod<List<dynamic>>('getVpnDebug');
+      if (res != null) logs = res;
+    } catch (_) {}
+
+    if (!mounted) return;
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF002823),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setModalState) {
+            final logText = logs.isEmpty ? 'لا توجد سجلات حالياً أو أن VPN قيد بدء التشغيل...' : logs.join('\n');
+            return Container(
+              padding: const EdgeInsets.all(20),
+              height: MediaQuery.of(context).size.height * 0.75,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text('سجل التشخيص والـ VPN 📋', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                      IconButton(
+                        icon: const Icon(Icons.close, color: Colors.white70),
+                        onPressed: () => Navigator.pop(ctx),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Expanded(
+                    child: Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.black45,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: Colors.white24),
+                      ),
+                      child: SingleChildScrollView(
+                        child: SelectableText(
+                          logText,
+                          style: const TextStyle(color: Color(0xFFFFEFB3), fontFamily: 'monospace', fontSize: 12),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFFFFEFB3), foregroundColor: Colors.black),
+                          icon: const Icon(Icons.copy),
+                          label: const Text('نسخ السجل بالكامل'),
+                          onPressed: () {
+                            Clipboard.setData(ClipboardData(text: logText));
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('تم نسخ السجل إلى الحافظة!'), backgroundColor: Colors.green),
+                            );
+                          },
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF374151), foregroundColor: Colors.white),
+                        icon: const Icon(Icons.refresh),
+                        label: const Text('تحديث'),
+                        onPressed: () async {
+                          try {
+                            final res = await _vpnChannel.invokeMethod<List<dynamic>>('getVpnDebug');
+                            if (res != null) {
+                              setModalState(() => logs = res);
+                            }
+                          } catch (_) {}
+                        },
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final usedMB = (stats['usage_today_bytes'] / (1024 * 1024)).round();
@@ -517,20 +608,30 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       ),
                     ],
                   ),
-                  GestureDetector(
-                    onTap: _toggleVpn,
-                    child: Container(
-                      padding: const EdgeInsets.all(12),
-                      decoration: BoxDecoration(
-                        color: _vpnConnected ? const Color(0xFF10B981) : const Color(0xFF374151),
-                        borderRadius: BorderRadius.circular(16),
+                  Row(
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.receipt_long, color: Color(0xFFFFEFB3)),
+                        tooltip: 'سجل التشخيص',
+                        onPressed: _showLogDialog,
                       ),
-                      child: Icon(
-                        _vpnConnected ? Icons.wifi : Icons.wifi_off,
-                        color: Colors.white,
-                        size: 28,
+                      const SizedBox(width: 8),
+                      GestureDetector(
+                        onTap: _toggleVpn,
+                        child: Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: _vpnConnected ? const Color(0xFF10B981) : const Color(0xFF374151),
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          child: Icon(
+                            _vpnConnected ? Icons.wifi : Icons.wifi_off,
+                            color: Colors.white,
+                            size: 28,
+                          ),
+                        ),
                       ),
-                    ),
+                    ],
                   ),
                 ],
               ),
