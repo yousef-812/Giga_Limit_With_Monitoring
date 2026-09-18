@@ -7,6 +7,7 @@ const dgram = require('dgram');
 const url = require('url');
 const fs = require('fs');
 const os = require('os');
+const crypto = require('crypto');
 const { Transform } = require('stream');
 const db = require('./db');
 
@@ -96,35 +97,100 @@ app.get('/download_app', (req, res) => {
     }
 });
 
-const getCleanIp = (req) => {
-    let ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-    if (ip.includes('::ffff:')) ip = ip.split('::ffff:')[1];
+const normalizeIp = (ip = '') => {
+    if (ip.startsWith('::ffff:')) return ip.substring(7);
+    if (ip === '::1') return '127.0.0.1';
     return ip;
+};
+
+// This LAN service is directly exposed, so forwarded headers are untrusted.
+const getCleanIp = (req) => normalizeIp(req.socket.remoteAddress || '');
+
+const publicUser = (user) => {
+    if (!user) return user;
+    const { device_token, ...safeUser } = user;
+    return safeUser;
+};
+
+const requireDevice = (req, res, deviceId) => {
+    const token = req.headers['x-device-token'];
+    if (!db.verifyDeviceToken(deviceId, token)) {
+        res.status(401).json({ error: 'Invalid device credentials' });
+        return null;
+    }
+    return db.getUserByDeviceId(deviceId);
+};
+
+const usedNetworkSignatures = new Map();
+const verifyNetworkSignature = (deviceId, timestamp, signature) => {
+    const user = db.getUserByDeviceId(deviceId);
+    const timestampNumber = Number(timestamp);
+    if (!user || !user.device_token || !Number.isFinite(timestampNumber) || typeof signature !== 'string') return false;
+    if (Math.abs(Date.now() - timestampNumber) > 30_000) return false;
+
+    const now = Date.now();
+    for (const [usedSignature, usedAt] of usedNetworkSignatures) {
+        if (now - usedAt > 60_000) usedNetworkSignatures.delete(usedSignature);
+    }
+    if (usedNetworkSignatures.has(signature)) return false;
+
+    const expectedHex = crypto
+        .createHmac('sha256', user.device_token)
+        .update(`${deviceId}:${timestamp}`)
+        .digest('hex');
+    if (!/^[0-9a-f]{64}$/i.test(signature)) return false;
+    const expected = Buffer.from(expectedHex, 'hex');
+    const supplied = Buffer.from(signature, 'hex');
+    const valid = expected.length === supplied.length && crypto.timingSafeEqual(expected, supplied);
+    if (valid) usedNetworkSignatures.set(signature, now);
+    return valid;
 };
 
 // --- MOBILE APP API ---
 
 app.post('/api/register', (req, res) => {
-    const { device_id, name } = req.body;
+    const { device_id, name, device_token, legacy_migration } = req.body;
     const ip = getCleanIp(req);
-    
+
     if (!device_id || !name) return res.status(400).json({ error: 'device_id and name required' });
+
+    const existing = db.getUserByDeviceId(device_id);
+    if (existing && existing.device_token && !db.verifyDeviceToken(device_id, device_token)) {
+        return res.status(401).json({ error: 'Device is already registered' });
+    }
+    if (existing && !existing.device_token) {
+        const sameIp = !existing.current_ip || existing.current_ip === ip;
+        const namedLegacyMigration = legacy_migration === true && existing.name === name;
+        if (!sameIp && !namedLegacyMigration) {
+            return res.status(401).json({ error: 'Legacy device migration rejected' });
+        }
+    }
 
     const defaultLimit = db.getSetting('global_daily_limit_mb') || 1024;
     const user = db.registerUser(name, device_id, ip, defaultLimit);
-    
-    res.json({ success: true, user, registered_ip: ip });
+
+    res.json({
+        success: true,
+        user: publicUser(user),
+        device_token: user.device_token,
+        registered_ip: ip
+    });
 });
 
 app.post('/api/ping', (req, res) => {
-    // This request can travel through the VPN proxy, where its source becomes
-    // the server itself. IP changes are accepted only from network_ping below.
     res.json({ success: true });
 });
 
-app.post('/api/network_ping', (req, res) => {
+const handleNetworkPing = (req, res) => {
     const { device_id } = req.body;
+    const timestamp = req.headers['x-device-timestamp'];
+    const signature = req.headers['x-device-signature'];
     const ip = getCleanIp(req);
+
+    if (!verifyNetworkSignature(device_id, timestamp, signature)) {
+        return res.status(401).json({ error: 'Invalid or replayed network signature' });
+    }
+
     const user = db.getUserByDeviceId(device_id);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
@@ -133,23 +199,22 @@ app.post('/api/network_ping', (req, res) => {
         appendDebugLog(`${new Date().toISOString()} [NETWORK_PING ${user.name} #${user.id}] ${ip}`);
     }
     res.json({ success: true, registered_ip: ip });
-});
+};
+
+app.post('/api/network_ping', handleNetworkPing);
 
 app.post('/api/clear_notification', (req, res) => {
     const { device_id } = req.body;
-    const user = db.getUserByDeviceId(device_id);
-    if (user) {
-        db.clearNotification(user.id);
-        res.json({ success: true });
-    } else {
-        res.status(404).json({ error: 'User not found' });
-    }
+    const user = requireDevice(req, res, device_id);
+    if (!user) return;
+    db.clearNotification(user.id);
+    res.json({ success: true });
 });
 
 app.post('/api/debug', (req, res) => {
     const { device_id, logs } = req.body;
-    const user = db.getUserByDeviceId(device_id);
-    if (!user) return res.status(404).json({ error: 'User not found' });
+    const user = requireDevice(req, res, device_id);
+    if (!user) return;
     if (!Array.isArray(logs)) return res.status(400).json({ error: 'logs must be an array' });
 
     const prefix = `${new Date().toISOString()} [${user.name} #${user.id}]`;
@@ -161,27 +226,60 @@ app.post('/api/debug', (req, res) => {
 });
 
 app.get('/api/status/:device_id', (req, res) => {
-    const device_id = req.params.device_id;
-    const ip = getCleanIp(req);
+    const deviceId = req.params.device_id;
+    const user = requireDevice(req, res, deviceId);
+    if (!user) return;
     const today = db.getLocalDateString();
-    
-    const user = db.getUserByDeviceId(device_id);
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    
-    const bytes_used = db.getUsage(user.id, today);
-    const weekly_bytes_used = db.getWeeklyUsage(user.id);
-    const daily_limit_bytes = user.daily_limit_mb * 1024 * 1024;
-    const weekly_limit_bytes = (user.weekly_limit_mb || (user.daily_limit_mb * 7)) * 1024 * 1024;
-    
+
+    const bytesUsed = db.getUsage(user.id, today);
+    const weeklyBytesUsed = db.getWeeklyUsage(user.id);
+    const dailyLimitBytes = user.daily_limit_mb * 1024 * 1024;
+    const weeklyLimitBytes = (user.weekly_limit_mb || (user.daily_limit_mb * 7)) * 1024 * 1024;
+
     res.json({
-        user,
-        usage_today_bytes: bytes_used,
-        daily_remaining_bytes: Math.max(0, daily_limit_bytes - bytes_used),
-        weekly_usage_bytes: weekly_bytes_used,
-        weekly_limit_bytes: weekly_limit_bytes,
+        user: publicUser(user),
+        usage_today_bytes: bytesUsed,
+        daily_remaining_bytes: Math.max(0, dailyLimitBytes - bytesUsed),
+        weekly_usage_bytes: weeklyBytesUsed,
+        weekly_limit_bytes: weeklyLimitBytes,
         can_connect: getEffectiveUserSpeed(user) > 0,
-        pending_notification: user.pending_notification || null
+        pending_notification: user.pending_notification || null,
+        monitoring_enabled: user.monitoring_enabled !== false
     });
+});
+
+// --- SOCIAL MONITORING ---
+// Phone asks every 20s whether it should keep capturing social apps/sites.
+app.get('/api/monitoring_status/:device_id', (req, res) => {
+    const deviceId = req.params.device_id;
+    const user = requireDevice(req, res, deviceId);
+    if (!user) return;
+    res.json({ monitoring_enabled: user.monitoring_enabled !== false });
+});
+
+// Screenshot upload (JPEG up to 5MB). Stored per user per day.
+app.post('/api/upload_screenshot', express.raw({ type: 'image/jpeg', limit: '5mb' }), (req, res) => {
+    const deviceId = req.headers['x-device-id'];
+    const user = requireDevice(req, res, deviceId);
+    if (!user) return;
+    if (user.monitoring_enabled === false) {
+        return res.status(403).json({ error: 'Monitoring not enabled' });
+    }
+    if (!req.body || !req.body.length) {
+        return res.status(400).json({ error: 'Missing image data' });
+    }
+
+    const safeName = String(user.name || `device_${user.id}`).replace(/[\\/:*?"<>|]/g, '_').slice(0, 60) || `device_${user.id}`;
+    const today = db.getLocalDateString();
+    const dir = path.join(appDir, 'screenshots', `${safeName}_${user.id}`, today);
+    try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+    const filePath = path.join(dir, `${Date.now()}.jpg`);
+    try {
+        fs.writeFileSync(filePath, req.body);
+    } catch (e) {
+        return res.status(500).json({ error: 'Could not save screenshot' });
+    }
+    res.json({ success: true });
 });
 
 // --- ADMIN API ---
@@ -205,7 +303,7 @@ app.get('/api/admin/debug', adminAuth, (req, res) => {
 
 app.get('/api/admin/users', adminAuth, (req, res) => {
     const today = db.getLocalDateString();
-    res.json(db.getUsersWithUsage(today));
+    res.json(db.getUsersWithUsage(today).map(publicUser));
 });
 
 app.post('/api/admin/update_user', adminAuth, (req, res) => {
@@ -284,6 +382,53 @@ app.post('/api/admin/delete_user', adminAuth, (req, res) => {
     } else {
         res.status(400).json({ error: 'User not found' });
     }
+});
+
+app.post('/api/admin/toggle_monitoring', adminAuth, (req, res) => {
+    const { id, enabled } = req.body;
+    if (db.setMonitoring(id, enabled)) {
+        res.json({ success: true });
+    } else {
+        res.status(400).json({ error: 'User not found' });
+    }
+});
+
+// List recent screenshots for a user (newest first, max 50).
+app.get('/api/admin/screenshots/:id', adminAuth, (req, res) => {
+    const user = db.getUserById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const safeName = String(user.name || `device_${user.id}`).replace(/[\\/:*?"<>|]/g, '_').slice(0, 60) || `device_${user.id}`;
+    const base = path.join(appDir, 'screenshots', `${safeName}_${user.id}`);
+    let files = [];
+    try {
+        if (fs.existsSync(base)) {
+            for (const date of fs.readdirSync(base)) {
+                const dateDir = path.join(base, date);
+                try {
+                    if (!fs.statSync(dateDir).isDirectory()) continue;
+                    for (const f of fs.readdirSync(dateDir)) {
+                        if (f.endsWith('.jpg')) files.push(`${date}/${f}`);
+                    }
+                } catch (_) {}
+            }
+        }
+    } catch (_) {}
+    files.sort().reverse();
+    res.json({ screenshots: files.slice(0, 50) });
+});
+
+app.get('/api/admin/screenshot/:id/:date/:file', adminAuth, (req, res) => {
+    const user = db.getUserById(req.params.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!/^[\d-]{8,10}$/.test(req.params.date) || !/^\d+\.jpg$/.test(req.params.file)) {
+        return res.status(400).json({ error: 'Invalid file' });
+    }
+    const safeName = String(user.name || `device_${user.id}`).replace(/[\\/:*?"<>|]/g, '_').slice(0, 60) || `device_${user.id}`;
+    const filePath = path.join(appDir, 'screenshots', `${safeName}_${user.id}`, req.params.date, req.params.file);
+    if (!filePath.startsWith(path.join(appDir, 'screenshots'))) return res.status(400).json({ error: 'Invalid path' });
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Not found' });
+    res.set('Content-Type', 'image/jpeg');
+    fs.createReadStream(filePath).pipe(res);
 });
 
 
@@ -410,8 +555,8 @@ function rateLimitedPipe(source, destination, getSpeed, ip) {
     const limiter = new Transform({
         transform(chunk, encoding, callback) {
             const bytesPerSecond = getSpeed();
-            if (bytesPerSecond === Infinity || !bytesPerSecond) return callback(null, chunk);
             if (bytesPerSecond <= 0) return callback(new Error('User speed limit reached'));
+            if (bytesPerSecond === Infinity) return callback(null, chunk);
             const bucket = getBucket(ip);
             const delay = consumeTokens(bucket, chunk.length, bytesPerSecond);
             if (delay <= 0) return callback(null, chunk);
@@ -517,38 +662,47 @@ proxyServer.on('connect', (req, clientSocket, head) => {
 
 // --- SSL + HTTPS ---
 function getSSL() {
-    if (pub && pub.sslKey && pub.sslCert) {
-        return { key: pub.sslKey, cert: pub.sslCert };
+    const keyPath = path.join(appDir, 'server.key');
+    const certPath = path.join(appDir, 'server.cert');
+    const rotationMarker = path.join(appDir, 'ssl_key_version_2');
+
+    // Rotate the formerly bundled key once, then keep a unique key per installation.
+    if (!fs.existsSync(rotationMarker)) {
+        try { fs.unlinkSync(keyPath); } catch (_) {}
+        try { fs.unlinkSync(certPath); } catch (_) {}
     }
-    if (!isPkg) {
-        try {
-            return {
-                key: fs.readFileSync(path.join(__dirname, 'server.key'), 'utf8'),
-                cert: fs.readFileSync(path.join(__dirname, 'server.cert'), 'utf8')
-            };
-        } catch (e) {}
-    }
+
     try {
+        if (fs.existsSync(keyPath) && fs.existsSync(certPath)) {
+            return {
+                key: fs.readFileSync(keyPath, 'utf8'),
+                cert: fs.readFileSync(certPath, 'utf8')
+            };
+        }
+
         const forge = require('node-forge');
         const keys = forge.pki.rsa.generateKeyPair(2048);
         const cert = forge.pki.createCertificate();
         cert.publicKey = keys.publicKey;
-        cert.serialNumber = '01';
+        cert.serialNumber = crypto.randomBytes(16).toString('hex');
         cert.validity.notBefore = new Date();
         cert.validity.notAfter = new Date();
         cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 10);
         const ip = getLocalIP();
-        cert.setSubject([{ name: 'commonName', value: ip }]);
-        cert.setIssuer([{ name: 'commonName', value: ip }]);
-        cert.sign(keys.privateKey);
+        const attributes = [{ name: 'commonName', value: ip }];
+        cert.setSubject(attributes);
+        cert.setIssuer(attributes);
+        cert.setExtensions([{ name: 'subjectAltName', altNames: [{ type: 7, ip }] }]);
+        cert.sign(keys.privateKey, forge.md.sha256.create());
         const keyPem = forge.pki.privateKeyToPem(keys.privateKey);
         const certPem = forge.pki.certificateToPem(cert);
-        fs.writeFileSync(path.join(appDir, 'server.key'), keyPem);
-        fs.writeFileSync(path.join(appDir, 'server.cert'), certPem);
-        console.log(`[SSL] Generated self-signed cert for IP: ${ip}`);
+        fs.writeFileSync(keyPath, keyPem, { mode: 0o600 });
+        fs.writeFileSync(certPath, certPem);
+        fs.writeFileSync(rotationMarker, 'per-installation TLS key v2\n');
+        console.log(`[SSL] Generated a unique self-signed certificate for IP: ${ip}`);
         return { key: keyPem, cert: certPem };
-    } catch (e) {
-        console.error('[SSL] Failed to generate certs:', e.message);
+    } catch (error) {
+        console.error('[SSL] Failed to prepare certificate:', error.message);
         return null;
     }
 }
@@ -558,25 +712,23 @@ const localIP = getLocalIP();
 try {
     const https = require('https');
     const ssl = getSSL();
-    if (ssl) {
-        https.createServer(ssl, app).listen(API_PORT, '0.0.0.0', () => {
-            console.log(`Giga Limit API running securely on HTTPS port ${API_PORT}`);
-            console.log(`Admin login: https://${localIP}:${API_PORT} (password in admin_credentials.txt)`);
-            console.log(`Local: https://localhost:${API_PORT}`);
-        });
-    } else {
-        throw new Error('No SSL');
-    }
-} catch (e) {
-    app.listen(API_PORT, '0.0.0.0', () => {
-        console.log(`Giga Limit API running on HTTP port ${API_PORT}`);
-        console.log(`Admin login: http://${localIP}:${API_PORT} (password in admin_credentials.txt)`);
+    if (!ssl) throw new Error('TLS certificate unavailable');
+    https.createServer(ssl, app).listen(API_PORT, '0.0.0.0', () => {
+        console.log(`Giga Limit API running securely on HTTPS port ${API_PORT}`);
+        console.log(`Admin login: https://${localIP}:${API_PORT} (password in admin_credentials.txt)`);
+        console.log(`Local: https://localhost:${API_PORT}`);
     });
+} catch (error) {
+    console.error(`[SSL] Refusing to expose the admin API without HTTPS: ${error.message}`);
+    process.exit(1);
 }
 
-const HTTP_PORT = 3001;
-app.listen(HTTP_PORT, '0.0.0.0', () => {
-    console.log(`Giga Limit API (Plain HTTP Fallback) running on port ${HTTP_PORT}`);
+// Plain HTTP is restricted to signed physical-IP reports only.
+const physicalIpApp = express();
+physicalIpApp.use(express.json({ limit: '16kb' }));
+physicalIpApp.post('/api/network_ping', handleNetworkPing);
+physicalIpApp.listen(3001, '0.0.0.0', () => {
+    console.log('Signed physical-IP reporter listening on HTTP port 3001');
 });
 
 proxyServer.listen(PROXY_PORT, '0.0.0.0', () => {

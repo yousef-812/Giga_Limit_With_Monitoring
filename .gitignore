@@ -34,6 +34,8 @@ server/GigaLimit_App.apk
 server/server.key
 server/server.cert
 server/public_bundle.js
+server/ssl_key_version_2
+server/screenshots/
 
 # Mobile Capacitor
 mobile/node_modules/

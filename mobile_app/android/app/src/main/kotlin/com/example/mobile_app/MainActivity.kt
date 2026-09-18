@@ -3,6 +3,7 @@ package com.example.mobile_app
 import android.content.Intent
 import android.net.VpnService
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -14,11 +15,27 @@ class MainActivity : FlutterActivity() {
     private var vpnResult: MethodChannel.Result? = null
     private var pendingServerIp: String? = null
     private var pendingDeviceId: String? = null
+    private var pendingDeviceToken: String? = null
     private val VPN_REQUEST_CODE = 1001
     private external fun getNativeDebug(): Array<String>
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.gigalimit.monitoring")
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "openAccessibilitySettings" -> {
+                        try {
+                            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("NO_SETTINGS", e.message, null)
+                        }
+                    }
+                    else -> result.notImplemented()
+                }
+            }
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
             .setMethodCallHandler { call, result ->
@@ -26,8 +43,9 @@ class MainActivity : FlutterActivity() {
                     "startVpn" -> {
                         val serverIp = call.argument<String>("server_ip")
                         val deviceId = call.argument<String>("device_id")
-                        if (serverIp == null || deviceId == null) {
-                            result.error("INVALID_ARGS", "server_ip and device_id required", null)
+                        val deviceToken = call.argument<String>("device_token")
+                        if (serverIp == null || deviceId == null || deviceToken == null) {
+                            result.error("INVALID_ARGS", "server_ip, device_id and device_token required", null)
                             return@setMethodCallHandler
                         }
 
@@ -35,10 +53,11 @@ class MainActivity : FlutterActivity() {
                         if (vpnIntent != null) {
                             pendingServerIp = serverIp
                             pendingDeviceId = deviceId
+                            pendingDeviceToken = deviceToken
                             vpnResult = result
                             startActivityForResult(vpnIntent, VPN_REQUEST_CODE)
                         } else {
-                            startVpnService(serverIp, deviceId)
+                            startVpnService(serverIp, deviceId, deviceToken)
                             result.success(true)
                         }
                     }
@@ -72,8 +91,9 @@ class MainActivity : FlutterActivity() {
             if (resultCode == RESULT_OK) {
                 val serverIp = pendingServerIp
                 val deviceId = pendingDeviceId
-                if (serverIp != null && deviceId != null) {
-                    startVpnService(serverIp, deviceId)
+                val deviceToken = pendingDeviceToken
+                if (serverIp != null && deviceId != null && deviceToken != null) {
+                    startVpnService(serverIp, deviceId, deviceToken)
                     vpnResult?.success(true)
                 } else {
                     vpnResult?.error("NO_SERVER", "Server IP not available", null)
@@ -83,14 +103,16 @@ class MainActivity : FlutterActivity() {
             }
             pendingServerIp = null
             pendingDeviceId = null
+            pendingDeviceToken = null
             vpnResult = null
         }
     }
 
-    private fun startVpnService(serverIp: String, deviceId: String) {
+    private fun startVpnService(serverIp: String, deviceId: String, deviceToken: String) {
         val intent = Intent(this, VpnProxyService::class.java)
         intent.putExtra("server_ip", serverIp)
         intent.putExtra("device_id", deviceId)
+        intent.putExtra("device_token", deviceToken)
         startForegroundService(intent)
     }
 }
