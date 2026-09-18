@@ -174,10 +174,19 @@ module.exports = {
         return user;
     },
 
+    normalizeIp: (ip) => {
+        if (!ip || typeof ip !== 'string') return '';
+        let cleaned = ip.trim();
+        if (cleaned.startsWith('::ffff:')) cleaned = cleaned.substring(7);
+        if (cleaned === '::1' || cleaned === 'localhost') return '127.0.0.1';
+        return cleaned;
+    },
+
     updateUserIp: (device_id, current_ip) => {
+        const normIp = typeof current_ip === 'string' ? current_ip.replace(/^::ffff:/, '').trim() : current_ip;
         let user = data.users.find(u => u.device_id === device_id);
         if (user) {
-            user.current_ip = current_ip;
+            user.current_ip = normIp;
             save();
         }
     },
@@ -192,7 +201,29 @@ module.exports = {
     },
     getUserById: (id) => data.users.find(u => u.id === parseInt(id)),
     
-    getUserByIp: (ip) => data.users.find(u => u.current_ip === ip),
+    getUserByIp: (rawIp) => {
+        if (!rawIp || typeof rawIp !== 'string') return undefined;
+        let cleaned = rawIp.trim();
+        if (cleaned.startsWith('::ffff:')) cleaned = cleaned.substring(7);
+        if (cleaned === '::1' || cleaned === 'localhost') cleaned = '127.0.0.1';
+
+        let user = data.users.find(u => {
+            if (!u.current_ip) return false;
+            let uIp = u.current_ip.trim();
+            if (uIp.startsWith('::ffff:')) uIp = uIp.substring(7);
+            if (uIp === '::1' || uIp === 'localhost') uIp = '127.0.0.1';
+            return uIp === cleaned;
+        });
+        if (user) return user;
+
+        // Auto-associate single registered active user on local subnet
+        if (data.users.length === 1 && data.users[0].status !== 'blocked') {
+            data.users[0].current_ip = cleaned;
+            save();
+            return data.users[0];
+        }
+        return undefined;
+    },
 
     setNotification: (id, message) => {
         let user = data.users.find(u => u.id === parseInt(id));

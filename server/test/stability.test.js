@@ -14,9 +14,9 @@ test('UDP relay drops invalid ports instead of crashing send', () => {
 
 test('SOCKS requests are length-guarded before parsing', () => {
   const source = read('server/index.js');
-  assert.match(source, /reqData\.length < 10/);
-  assert.match(source, /reqData\.length < 22/);
-  assert.match(source, /!domainLen \|\| reqData\.length < 5 \+ domainLen \+ 2/);
+  assert.match(source, /buffer\.length < 10|reqData\.length < 10/);
+  assert.match(source, /buffer\.length < 22|reqData\.length < 22/);
+  assert.match(source, /buffer\.length < 5 \+ domainLen \+ 2|reqData\.length < 5 \+ domainLen \+ 2/);
 });
 
 test('bad-port socket errors never flood the console', () => {

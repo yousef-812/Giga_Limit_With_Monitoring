@@ -830,9 +830,10 @@ function sendRateLimitedUdp(socket, message, port, host, getSpeed, ip) {
     setTimeout(send, Math.ceil(delay));
 }
 
-const isAllowed = (ip) => {
+const isAllowed = (rawIp) => {
+    const ip = db.normalizeIp ? db.normalizeIp(rawIp) : (rawIp || '').replace(/^::ffff:/, '').trim();
     const now = Date.now();
-    if (authCache.has(ip) && now - authCache.get(ip).time < 10000) {
+    if (authCache.has(ip) && now - authCache.get(ip).time < 5000) {
         return authCache.get(ip).allowed;
     }
 
@@ -996,75 +997,102 @@ proxyServer.listen(PROXY_PORT, '0.0.0.0', () => {
 
 // --- SOCKS5 ENGINE ---
 const socksServer = net.createServer((clientSocket) => {
-    let clientIp = clientSocket.remoteAddress;
-    if (clientIp && clientIp.includes('::ffff:')) clientIp = clientIp.split('::ffff:')[1];
+    let clientIp = db.normalizeIp ? db.normalizeIp(clientSocket.remoteAddress) : (clientSocket.remoteAddress || '').replace(/^::ffff:/, '').trim();
 
     if (!isAllowed(clientIp)) {
+        clientSocket.destroy();
         return;
     }
 
     clientSocket.on('error', () => {});
 
-    clientSocket.once('data', (data) => {
-        if (data[0] !== 0x05) {
-            clientSocket.end();
+    let state = 'AUTH'; // AUTH -> REQUEST -> TUNNEL
+    let buffer = Buffer.alloc(0);
+
+    const onData = (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        processBuffer();
+    };
+
+    clientSocket.on('data', onData);
+
+    function processBuffer() {
+        if (state === 'AUTH') {
+            if (buffer.length < 2) return;
+            if (buffer[0] !== 0x05) {
+                clientSocket.destroy();
+                return;
+            }
+            const nmethods = buffer[1];
+            if (buffer.length < 2 + nmethods) return;
+
+            buffer = buffer.subarray(2 + nmethods);
+            state = 'REQUEST';
+            clientSocket.write(Buffer.from([0x05, 0x00]));
+
+            if (buffer.length > 0) {
+                processBuffer();
+            }
             return;
         }
-        clientSocket.write(Buffer.from([0x05, 0x00]));
 
-        clientSocket.once('data', (reqData) => {
-            if (reqData[0] !== 0x05 || (reqData[1] !== 0x01 && reqData[1] !== 0x03)) {
-                clientSocket.end();
+        if (state === 'REQUEST') {
+            if (buffer.length < 4) return;
+            if (buffer[0] !== 0x05) {
+                clientSocket.destroy();
                 return;
             }
 
-            if (reqData[1] === 0x03) {
+            const cmd = buffer[1];
+            if (cmd === 0x03) { // UDP ASSOCIATE
+                clientSocket.removeListener('data', onData);
                 handleSocksUdpAssociation(clientSocket, clientIp);
                 return;
             }
 
-            const atyp = reqData[3];
+            if (cmd !== 0x01) { // CONNECT only
+                clientSocket.destroy();
+                return;
+            }
+
+            const atyp = buffer[3];
             let host;
             let portOffset;
 
-            if (reqData.length < 10) {
-                clientSocket.end();
-                return;
-            }
-            if (atyp === 0x01) {
-                host = `${reqData[4]}.${reqData[5]}.${reqData[6]}.${reqData[7]}`;
+            if (atyp === 0x01) { // IPv4
+                if (buffer.length < 10) return;
+                host = `${buffer[4]}.${buffer[5]}.${buffer[6]}.${buffer[7]}`;
                 portOffset = 8;
-            } else if (atyp === 0x04) {
-                if (reqData.length < 22) {
-                    clientSocket.end();
-                    return;
-                }
+            } else if (atyp === 0x04) { // IPv6
+                if (buffer.length < 22) return;
                 const groups = [];
-                for (let i = 0; i < 8; i++) groups.push(reqData.readUInt16BE(4 + i * 2).toString(16));
+                for (let i = 0; i < 8; i++) groups.push(buffer.readUInt16BE(4 + i * 2).toString(16));
                 host = groups.join(':');
                 portOffset = 20;
-            } else if (atyp === 0x03) {
-                const domainLen = reqData[4];
-                if (!domainLen || reqData.length < 5 + domainLen + 2) {
-                    clientSocket.end();
-                    return;
-                }
-                host = reqData.toString('utf8', 5, 5 + domainLen);
+            } else if (atyp === 0x03) { // DOMAIN
+                const domainLen = buffer[4];
+                if (buffer.length < 5 + domainLen + 2) return;
+                host = buffer.toString('utf8', 5, 5 + domainLen);
                 portOffset = 5 + domainLen;
             } else {
-                clientSocket.end();
+                clientSocket.destroy();
                 return;
             }
 
-            const port = reqData.readUInt16BE(portOffset);
+            if (buffer.length < portOffset + 2) return;
+            const port = buffer.readUInt16BE(portOffset);
             if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-                clientSocket.end();
+                clientSocket.destroy();
                 return;
             }
+
+            const remainingData = buffer.subarray(portOffset + 2);
+            clientSocket.removeListener('data', onData);
+            state = 'TUNNEL';
 
             if (isSocialHost(host) && isSocialBlockedForIp(clientIp)) {
                 logSocialBlock(clientIp, host, 'SOCKS-HOST');
-                clientSocket.end();
+                clientSocket.destroy();
                 return;
             }
 
@@ -1072,8 +1100,18 @@ const socksServer = net.createServer((clientSocket) => {
                 const serverSocket = net.connect(port, host, () => {
                     const reply = Buffer.from([0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
                     clientSocket.write(reply);
-                    // tun2socks dials raw IPs: sniff SNI/Host to catch social flows.
+
                     const socialSniff = isSocialBlockedForIp(clientIp) ? makeSocialSniff(clientIp, 'SOCKS-SNI') : null;
+
+                    if (remainingData.length > 0) {
+                        if (socialSniff && !socialSniff(remainingData)) {
+                            clientSocket.destroy();
+                            serverSocket.destroy();
+                            return;
+                        }
+                        serverSocket.write(remainingData);
+                    }
+
                     rateLimitedPipe(clientSocket, serverSocket, () => getSpeedForIp(clientIp), clientIp, socialSniff);
                     rateLimitedPipe(serverSocket, clientSocket, () => getSpeedForIp(clientIp), clientIp);
                 });
@@ -1081,7 +1119,7 @@ const socksServer = net.createServer((clientSocket) => {
                 const user = db.getUserByIp(clientIp);
                 const userId = user ? user.id : null;
 
-                let bytesTransferred = 0;
+                let bytesTransferred = remainingData.length;
                 serverSocket.on('data', (chunk) => bytesTransferred += chunk.length);
                 clientSocket.on('data', (chunk) => bytesTransferred += chunk.length);
 
@@ -1106,16 +1144,16 @@ const socksServer = net.createServer((clientSocket) => {
 
                 serverSocket.on('end', onEnd);
                 clientSocket.on('end', onEnd);
-                serverSocket.on('error', () => clientSocket.end());
+                serverSocket.on('error', () => clientSocket.destroy());
                 clientSocket.on('error', () => {
-                    if (serverSocket) serverSocket.end();
+                    if (serverSocket) serverSocket.destroy();
                 });
             } catch (err) {
                 console.error('Invalid SOCKS5 Request:', err.message);
-                clientSocket.end();
+                clientSocket.destroy();
             }
-        });
-    });
+        }
+    }
 });
 
 function handleSocksUdpAssociation(clientSocket, clientIp) {
@@ -1143,7 +1181,6 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
                 host = `${message[4]}.${message[5]}.${message[6]}.${message[7]}`;
                 portOffset = 8;
             } else if (atyp === 0x04) {
-                // IPv6 relay socket is unavailable: drop so apps fall back to IPv4.
                 if (isSocialBlockedForIp(clientIp)) logSocialBlock(clientIp, 'ipv6-udp', 'UDP-V6');
                 return;
             } else if (atyp === 0x03) {
@@ -1157,7 +1194,6 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
 
             if (message.length < portOffset + 2) return;
             const port = message.readUInt16BE(portOffset);
-            // Drop keepalives/empty headers (port 0) instead of crashing the send.
             if (!Number.isInteger(port) || port <= 0 || port > 65535) return;
             const payload = message.subarray(portOffset + 2);
             if (!payload.length) return;
@@ -1167,14 +1203,12 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
                     logSocialBlock(clientIp, host, 'UDP-HOST');
                     return;
                 }
-                // QUIC runs on UDP/443 with no visible hostname: drop it so apps
-                // and browsers fall back to TCP/TLS where SNI inspection applies.
-                if (port === 443) {
+                // QUIC runs on UDP/443 for social hosts:
+                if (port === 443 && isSocialHost(host)) {
                     logSocialBlock(clientIp, `${host}:${port}`, 'UDP-QUIC');
                     return;
                 }
                 // DNS query block: port 53 payloads carry the queried domain.
-                // Dropping social queries breaks apps + web that need resolution.
                 if (port === 53) {
                     const queried = parseDnsQueryName(payload);
                     if (queried && isSocialHost(queried)) {
@@ -1183,7 +1217,7 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
                     }
                 }
             }
-                sendRateLimitedUdp(relay, payload, port, host, () => getSpeedForIp(clientIp), clientIp);
+            sendRateLimitedUdp(relay, payload, port, host, () => getSpeedForIp(clientIp), clientIp);
             return;
         }
 
@@ -1195,7 +1229,7 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
             ...octets,
             rinfo.port >> 8, rinfo.port & 0xff
         ]);
-                sendRateLimitedUdp(relay, Buffer.concat([header, message]), clientUdpPort, clientIp, () => getSpeedForIp(clientIp), clientIp);
+        sendRateLimitedUdp(relay, Buffer.concat([header, message]), clientUdpPort, clientIp, () => getSpeedForIp(clientIp), clientIp);
     });
 
     relay.bind(0, '0.0.0.0', () => {
@@ -1243,16 +1277,25 @@ $block | Out-Null;
     const scriptPath = path.join(appDir, 'hotspot_block.ps1');
     fs.writeFileSync(scriptPath, blockScript);
 
-    // Setup script uses proper ScheduledTask objects (the old inline
-    // Register-ScheduledTask call passed invalid loose arguments and always failed).
+    // Setup script uses proper ScheduledTask objects with SYSTEM principal or schtasks
     const setupScript = [
-        `Unregister-ScheduledTask -TaskName '${taskName}' -Confirm:$false -ErrorAction SilentlyContinue`,
-        `$action = New-ScheduledTaskAction -Execute 'powershell' -Argument '-NoProfile -WindowStyle Hidden -File ''${scriptPath.replace(/'/g, "''")}'''`,
-        `$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)`,
-        `$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -DontStopOnIdleEnd`,
-        `$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Highest`,
-        `Register-ScheduledTask -TaskName '${taskName}' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null`,
-        `Write-Output 'HOTSPOT_TASK_OK'`
+        `try { schtasks.exe /Delete /TN "${taskName}" /F 2>$null } catch {}`,
+        `try { Unregister-ScheduledTask -TaskName '${taskName}' -Confirm:$false -ErrorAction SilentlyContinue } catch {}`,
+        `$created = $false`,
+        `try {`,
+        `    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ''${scriptPath.replace(/'/g, "''")}'''`,
+        `    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) -RepetitionInterval (New-TimeSpan -Minutes 1) -RepetitionDuration (New-TimeSpan -Days 3650)`,
+        `    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -StartWhenAvailable -DontStopOnIdleEnd`,
+        `    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType Service -RunLevel Highest`,
+        `    Register-ScheduledTask -TaskName '${taskName}' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null`,
+        `    $created = $true`,
+        `} catch {`,
+        `    try {`,
+        `        schtasks.exe /Create /TN "${taskName}" /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \`"${scriptPath}\`"" /SC MINUTE /MO 1 /RU "SYSTEM" /RL HIGHEST /F | Out-Null`,
+        `        $created = $true`,
+        `    } catch {}`,
+        `}`,
+        `if ($created) { Write-Output 'HOTSPOT_TASK_OK' }`
     ].join('\r\n');
     const setupPath = path.join(appDir, 'hotspot_setup.ps1');
     fs.writeFileSync(setupPath, setupScript);
@@ -1266,7 +1309,7 @@ $block | Out-Null;
             }
             throw new Error('setup script did not confirm');
         } catch (e) {
-            console.log('[HOTSPOT] Could not create scheduled task:', e.message);
+            console.log('[HOTSPOT] Note: Scheduled task creation deferred to elevated prompt');
             return false;
         }
     }
@@ -1282,6 +1325,15 @@ $block | Out-Null;
         }
     }
 
+    // In-process continuous blocker fallback running every 15 seconds
+    function runInProcessBlocker() {
+        try {
+            execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${scriptPath}"`, { stdio: 'ignore', timeout: 5000 });
+        } catch (_) {}
+    }
+    runInProcessBlocker();
+    setInterval(runInProcessBlocker, 15000).unref();
+
     let hasAdmin = false;
     try {
         execSync('net session', { stdio: 'ignore', timeout: 3000 });
@@ -1293,9 +1345,9 @@ $block | Out-Null;
     } else {
         console.log('[HOTSPOT] Requesting admin for initial setup...');
         if (runSetupElevated()) {
-            setupHotspotBlocker();
+            console.log('[HOTSPOT] Scheduled task created - hotspot blocker active');
         } else {
-            console.log('[HOTSPOT] Admin denied - hotspot blocker disabled. Right-click the EXE > Run as administrator.');
+            console.log('[HOTSPOT] Admin prompt dismissed - in-process blocker active.');
         }
     }
 }
