@@ -194,6 +194,72 @@ const isSocialBlockedForIp = (ip) => {
     return Boolean(user && user.social_blocked === true);
 };
 
+// Extract TLS Server Name Indication from a ClientHello packet.
+// VPN/tunneled apps connect by raw IP (DNS already resolved on the phone),
+// so the hostname is only visible here. Returns lowercase hostname or null.
+const parseTlsSni = (buf) => {
+    try {
+        if (!Buffer.isBuffer(buf) || buf.length < 50) return null;
+        if (buf[0] !== 0x16 || buf[1] !== 0x03) return null;
+        if (buf[5] !== 0x01) return null; // not a ClientHello
+        let offset = 9 + 2 + 32; // handshake header + version + random
+        if (offset >= buf.length) return null;
+        const sessionLen = buf[offset];
+        offset += 1 + sessionLen;
+        if (offset + 2 > buf.length) return null;
+        const cipherLen = buf.readUInt16BE(offset);
+        offset += 2 + cipherLen;
+        if (offset >= buf.length) return null;
+        const compLen = buf[offset];
+        offset += 1 + compLen;
+        if (offset + 2 > buf.length) return null;
+        const extTotal = buf.readUInt16BE(offset);
+        offset += 2;
+        const extEnd = offset + extTotal;
+        while (offset + 4 <= buf.length && offset + 4 <= extEnd) {
+            const extType = buf.readUInt16BE(offset);
+            const extLen = buf.readUInt16BE(offset + 2);
+            offset += 4;
+            if (offset + extLen > buf.length) return null;
+            if (extType === 0x0000 && extLen >= 5) {
+                let p = offset + 2; // skip server_name list length
+                const nameType = buf[p];
+                const nameLen = buf.readUInt16BE(p + 1);
+                p += 3;
+                if (nameType === 0 && p + nameLen <= buf.length) {
+                    return buf.toString('utf8', p, p + nameLen).toLowerCase();
+                }
+                return null;
+            }
+            offset += extLen;
+        }
+        return null;
+    } catch (_) {
+        return null;
+    }
+};
+
+// Extract Host header from a plain-HTTP request head. Null if absent.
+const parseHttpHost = (buf) => {
+    try {
+        const head = buf.toString('latin1', 0, Math.min(buf.length, 2048));
+        if (!/^(GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|CONNECT)\s/i.test(head)) return null;
+        const m = head.match(/[\r\n]Host:\s*([^\r\n]+)/i);
+        return m ? m[1].trim().toLowerCase() : null;
+    } catch (_) {
+        return null;
+    }
+};
+
+const blockLogThrottle = new Map();
+const logSocialBlock = (ip, dest) => {
+    const key = `${ip}=>${dest}`;
+    const now = Date.now();
+    if (blockLogThrottle.has(key) && now - blockLogThrottle.get(key) < 60000) return;
+    blockLogThrottle.set(key, now);
+    appendDebugLog(`${new Date().toISOString()} [SOCIAL_BLOCK ${ip}] ${dest}`);
+};
+
 // --- MOBILE APP API ---
 
 app.post('/api/register', (req, res) => {
@@ -328,6 +394,7 @@ app.post('/api/upload_screenshot', express.raw({ type: 'image/jpeg', limit: '5mb
     } catch (e) {
         return res.status(500).json({ error: 'Could not save screenshot' });
     }
+    appendDebugLog(`${new Date().toISOString()} [SCREENSHOT ${user.name} #${user.id}] ${filePath} (${req.body.length} bytes)`);
     res.json({ success: true });
 });
 
@@ -615,9 +682,18 @@ setInterval(() => {
     }
 }, 1000);
 
-function rateLimitedPipe(source, destination, getSpeed, ip) {
+function rateLimitedPipe(source, destination, getSpeed, ip, inspectFirstChunk = null) {
+    let inspected = false;
     const limiter = new Transform({
         transform(chunk, encoding, callback) {
+            if (inspectFirstChunk && !inspected) {
+                inspected = true;
+                try {
+                    if (inspectFirstChunk(chunk) === false) {
+                        return callback(new Error('Social media blocked for this device'));
+                    }
+                } catch (_) {}
+            }
             const bytesPerSecond = getSpeed();
             if (bytesPerSecond <= 0) return callback(new Error('User speed limit reached'));
             if (bytesPerSecond === Infinity) return callback(null, chunk);
@@ -633,6 +709,17 @@ function rateLimitedPipe(source, destination, getSpeed, ip) {
     });
     source.pipe(limiter).pipe(destination);
 }
+
+// First-chunk inspector for upload pipes of social-blocked devices.
+// Catches IP-based flows (tunneled apps/browsers) via TLS SNI or HTTP Host.
+const makeSocialSniff = (clientIp) => (chunk) => {
+    const dest = parseTlsSni(chunk) || parseHttpHost(chunk);
+    if (dest && isSocialHost(dest)) {
+        logSocialBlock(clientIp, dest);
+        return false;
+    }
+    return true;
+};
 
 function sendRateLimitedUdp(socket, message, port, host, getSpeed, ip) {
     const bytesPerSecond = getSpeed();
@@ -687,7 +774,9 @@ proxyServer.on('connect', (req, clientSocket, head) => {
         const serverSocket = net.connect(port || 443, hostname, () => {
             clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
             serverSocket.write(head);
-            rateLimitedPipe(clientSocket, serverSocket, () => getSpeedForIp(clientIp), clientIp);
+            // Sniff tunneled TLS/HTTP for IP-based social flows (browsers via VPN).
+            const socialSniff = isSocialBlockedForIp(clientIp) ? makeSocialSniff(clientIp) : null;
+            rateLimitedPipe(clientSocket, serverSocket, () => getSpeedForIp(clientIp), clientIp, socialSniff);
             rateLimitedPipe(serverSocket, clientSocket, () => getSpeedForIp(clientIp), clientIp);
         });
 
@@ -860,7 +949,9 @@ const socksServer = net.createServer((clientSocket) => {
                 const serverSocket = net.connect(port, host, () => {
                     const reply = Buffer.from([0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
                     clientSocket.write(reply);
-                    rateLimitedPipe(clientSocket, serverSocket, () => getSpeedForIp(clientIp), clientIp);
+                    // tun2socks dials raw IPs: sniff SNI/Host to catch social flows.
+                    const socialSniff = isSocialBlockedForIp(clientIp) ? makeSocialSniff(clientIp) : null;
+                    rateLimitedPipe(clientSocket, serverSocket, () => getSpeedForIp(clientIp), clientIp, socialSniff);
                     rateLimitedPipe(serverSocket, clientSocket, () => getSpeedForIp(clientIp), clientIp);
                 });
 

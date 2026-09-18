@@ -25,6 +25,9 @@ test('social block enforced on HTTP, CONNECT, SOCKS TCP and UDP DNS', () => {
   const source = read('server/index.js');
   assert.match(source, /Forbidden: Social media blocked for this device/);
   assert.match(source, /parseDnsQueryName/);
+  assert.match(source, /parseTlsSni/);
+  assert.match(source, /parseHttpHost/);
+  assert.match(source, /makeSocialSniff/);
   assert.match(source, /toggle_social/);
   assert.match(source, /setSocialBlocked/);
 });
@@ -36,4 +39,6 @@ test('social block is per device with safe defaults', () => {
   const ui = read('server/public/index.html');
   assert.match(ui, /toggleSocial/);
   assert.match(ui, /toggle_social/);
+  assert.match(ui, /toggleShots/);
+  assert.match(ui, /screenshots/);
 });

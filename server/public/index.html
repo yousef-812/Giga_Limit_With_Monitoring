@@ -526,12 +526,16 @@
                     <button class="btn-small" style="grid-column: span 2; margin-top: 0.5rem; background: var(--primary); color: var(--bg);" onclick="sendNotification(${u.id})">
                         إرسال إشعار 🔔
                     </button>
-                    <button class="btn-small" style="grid-column: span 2; margin-top: 0.5rem; background: ${(u.monitoring_enabled !== false) ? 'rgba(239, 68, 68, 0.15)' : 'rgba(16, 185, 129, 0.15)'};" onclick="toggleMonitoring(${u.id}, ${(u.monitoring_enabled !== false) ? 'false' : 'true'})">
+                    <button class="btn-small" data-btn="monitoring" style="grid-column: span 2; margin-top: 0.5rem; background: ${(u.monitoring_enabled !== false) ? 'rgba(239, 68, 68, 0.15)' : 'rgba(16, 185, 129, 0.15)'};" onclick="toggleMonitoring(${u.id}, ${(u.monitoring_enabled !== false) ? 'false' : 'true'})">
                         ${(u.monitoring_enabled !== false) ? 'إيقاف متابعة السوشيال ❌' : 'تشغيل متابعة السوشيال 👁️'}
                     </button>
-                    <button class="btn-small" style="grid-column: span 2; margin-top: 0.5rem; background: ${(u.social_blocked === true) ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)'};" onclick="toggleSocial(${u.id}, ${(u.social_blocked === true) ? 'false' : 'true'})">
+                    <button class="btn-small" data-btn="social" style="grid-column: span 2; margin-top: 0.5rem; background: ${(u.social_blocked === true) ? 'rgba(16, 185, 129, 0.15)' : 'rgba(239, 68, 68, 0.15)'};" onclick="toggleSocial(${u.id}, ${(u.social_blocked === true) ? 'false' : 'true'})">
                         ${(u.social_blocked === true) ? 'فك منع السوشيال ✅' : 'منع السوشيال 🚫'}
                     </button>
+                    <button class="btn-small" data-btn="shots" style="grid-column: span 2; margin-top: 0.5rem;" onclick="toggleShots(${u.id})">
+                        عرض صور المراقبة 🖼️
+                    </button>
+                    <div data-field="shots" id="shots-${u.id}" style="grid-column: span 2; display: none; gap: 0.5rem; flex-wrap: wrap;"></div>
                 </div>
             `;
             return card;
@@ -587,6 +591,20 @@
             if (unlimitedBtn) {
                 unlimitedBtn.textContent = u.status === 'unlimited' ? 'إلغاء غير المحدود' : 'إنترنت غير محدود';
                 unlimitedBtn.setAttribute('onclick', `updateUser(${u.id}, '${u.status === 'unlimited' ? 'active' : 'unlimited'}', ${u.daily_limit_mb}, ${weeklyLimit})`);
+            }
+
+            const monOn = u.monitoring_enabled !== false;
+            const monBtn = card.querySelector('[data-btn="monitoring"]');
+            if (monBtn) {
+                monBtn.textContent = monOn ? 'إيقاف متابعة السوشيال ❌' : 'تشغيل متابعة السوشيال 👁️';
+                monBtn.setAttribute('onclick', `toggleMonitoring(${u.id}, ${monOn ? 'false' : 'true'})`);
+            }
+
+            const socBlocked = u.social_blocked === true;
+            const socBtn = card.querySelector('[data-btn="social"]');
+            if (socBtn) {
+                socBtn.textContent = socBlocked ? 'فك منع السوشيال ✅' : 'منع السوشيال 🚫';
+                socBtn.setAttribute('onclick', `toggleSocial(${u.id}, ${socBlocked ? 'false' : 'true'})`);
             }
         }
 
@@ -688,6 +706,41 @@
                 body: JSON.stringify({ id, blocked })
             });
             loadUsers();
+        }
+
+        async function toggleShots(id) {
+            const box = document.getElementById(`shots-${id}`);
+            if (!box) return;
+            if (box.style.display !== 'none' && box.dataset.loaded === '1') {
+                box.style.display = 'none';
+                return;
+            }
+            box.style.display = 'flex';
+            box.innerHTML = '<span style="color: var(--text-muted);">جاري التحميل...</span>';
+            try {
+                const res = await fetch(`/api/admin/screenshots/${id}`, { headers: { 'Authorization': authToken } });
+                const data = await res.json();
+                const files = (data.screenshots || []).slice(0, 12);
+                if (!files.length) {
+                    box.innerHTML = '<span style="color: var(--text-muted);">لا توجد صور بعد. تأكد أن المراقبة مفعلة وخدمة إتاحة الوصول شغالة على الموبايل.</span>';
+                    box.dataset.loaded = '1';
+                    return;
+                }
+                box.innerHTML = '';
+                for (const f of files) {
+                    const imgRes = await fetch(`/api/admin/screenshot/${id}/${f}`, { headers: { 'Authorization': authToken } });
+                    if (!imgRes.ok) continue;
+                    const blob = await imgRes.blob();
+                    const img = document.createElement('img');
+                    img.src = URL.createObjectURL(blob);
+                    img.style.cssText = 'width: 120px; border-radius: 8px; border: 1px solid var(--border);';
+                    img.loading = 'lazy';
+                    box.appendChild(img);
+                }
+                box.dataset.loaded = '1';
+            } catch (e) {
+                box.innerHTML = '<span style="color: var(--danger);">تعذر تحميل الصور.</span>';
+            }
         }
     </script>
 </body>
