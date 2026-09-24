@@ -23,20 +23,71 @@ const PROXY_PORT = 8080;
 const debugLogPath = path.join(appDir, 'vpn_debug.log');
 const MAX_DEBUG_LOG_LINES = 1000;
 
+// Async batched logger: log calls only queue a string (microseconds) and a
+// timer flushes everything to disk twice a second. No per-event disk I/O,
+// no file re-reads on the hot path, so logging never slows the proxy.
+const logQueue = [];
+let logFlushTimer = null;
+const logBytesSinceTrim = new Map();
+
+function trimLogFile(filePath, maxLines) {
+    try {
+        const lines = fs.readFileSync(filePath, 'utf8').split(/\r?\n/).filter(Boolean);
+        if (lines.length > maxLines) {
+            fs.writeFileSync(filePath, `${lines.slice(-maxLines).join('\n')}\n`);
+        }
+    } catch (_) {}
+}
+
+function flushLogQueue() {
+    logFlushTimer = null;
+    if (!logQueue.length) return;
+    const batch = logQueue.splice(0, logQueue.length);
+    const byFile = new Map();
+    for (const entry of batch) {
+        if (!byFile.has(entry.filePath)) byFile.set(entry.filePath, []);
+        byFile.get(entry.filePath).push(entry.line);
+    }
+    for (const [filePath, lines] of byFile) {
+        try {
+            const text = `${lines.join('\n')}\n`;
+            fs.appendFileSync(filePath, text);
+            const bytes = (logBytesSinceTrim.get(filePath) || 0) + Buffer.byteLength(text);
+            logBytesSinceTrim.set(filePath, bytes);
+            if (bytes > 512 * 1024) {
+                logBytesSinceTrim.set(filePath, 0);
+                trimLogFile(filePath, filePath === activityLogPath ? MAX_ACTIVITY_LINES : MAX_DEBUG_LOG_LINES);
+            }
+        } catch (_) {}
+    }
+}
+
+function queueLogLine(filePath, line) {
+    logQueue.push({ filePath, line });
+    if (logQueue.length > 5000) logQueue.splice(0, logQueue.length - 5000); // memory cap
+    if (!logFlushTimer) {
+        logFlushTimer = setTimeout(flushLogQueue, 500);
+        if (logFlushTimer.unref) logFlushTimer.unref();
+    }
+}
+
+process.on('exit', () => {
+    try {
+        if (logFlushTimer) clearTimeout(logFlushTimer);
+        logFlushTimer = null;
+        flushLogQueue();
+    } catch (_) {}
+});
+
 function appendDebugLog(lines) {
     if (!lines) return;
-    fs.appendFileSync(debugLogPath, `${lines}\n`);
-    const logLines = fs.readFileSync(debugLogPath, 'utf8').split(/\r?\n/).filter(Boolean);
-    if (logLines.length > MAX_DEBUG_LOG_LINES) {
-        fs.writeFileSync(debugLogPath, `${logLines.slice(-MAX_DEBUG_LOG_LINES).join('\n')}\n`);
-    }
+    queueLogLine(debugLogPath, String(lines));
 }
 
 // Detailed activity log: exact event trail (file next to the server EXE).
 // Dashboard shows it under "سجل النشاط" and it can be sent for diagnosis.
 const activityLogPath = path.join(appDir, 'giga_activity.log');
 const MAX_ACTIVITY_LINES = 5000;
-let diagWrites = 0;
 const throttleMap = new Map();
 const shouldLog = (key, ms) => {
     const now = Date.now();
@@ -47,24 +98,15 @@ const shouldLog = (key, ms) => {
 };
 
 function diagLog(tag, msg, mirror = true) {
-    try {
-        const line = `${new Date().toISOString()} [${tag}] ${msg}`;
-        console.log(line);
-        fs.appendFileSync(activityLogPath, `${line}\n`);
-        if (mirror) {
-            try { appendDebugLog(line); } catch (_) {}
-        }
-        if (++diagWrites % 100 === 0) {
-            try {
-                const stat = fs.statSync(activityLogPath);
-                if (stat.size > 1024 * 1024) {
-                    const lines = fs.readFileSync(activityLogPath, 'utf8').split(/\r?\n/).filter(Boolean);
-                    fs.writeFileSync(activityLogPath, `${lines.slice(-MAX_ACTIVITY_LINES).join('\n')}\n`);
-                }
-            } catch (_) {}
-        }
-    } catch (_) {}
+    const line = `${new Date().toISOString()} [${tag}] ${msg}`;
+    queueLogLine(activityLogPath, line);
+    if (mirror) queueLogLine(debugLogPath, line);
 }
+
+// Per-flow chatter (every CONNECT/DIAL/packet) is noise by default:
+// enable with GIGA_NETLOG=1 when deep tracing is needed.
+const NETLOG = process.env.GIGA_NETLOG === '1';
+const netlog = (tag, msg) => { if (NETLOG) diagLog(tag, msg); };
 
 app.use(cors());
 app.use(express.json());
@@ -791,24 +833,57 @@ setInterval(() => {
 }, 1000);
 
 function rateLimitedPipe(source, destination, getSpeed, ip, inspectFirstChunk = null) {
-    let inspected = false;
+    // 'wait' verdict support: hold handshake bytes until the inspector decides.
+    let pending = [];
+    let verdict = inspectFirstChunk ? null : true;
+    const speedStep = (chunk, encoding, callback) => {
+        const bytesPerSecond = getSpeed();
+        if (bytesPerSecond <= 0) return callback(new Error('User speed limit reached'));
+        if (bytesPerSecond === Infinity) return callback(null, chunk);
+        const bucket = getBucket(ip);
+        const delay = consumeTokens(bucket, chunk.length, bytesPerSecond);
+        if (delay <= 0) return callback(null, chunk);
+        setTimeout(() => callback(null, chunk), Math.ceil(delay));
+    };
     const limiter = new Transform({
         transform(chunk, encoding, callback) {
-            if (inspectFirstChunk && !inspected) {
-                inspected = true;
+            if (verdict === null) {
+                let r = true;
                 try {
-                    if (inspectFirstChunk(chunk) === false) {
-                        return callback(new Error('Social media blocked for this device'));
+                    r = inspectFirstChunk(chunk);
+                } catch (_) { r = true; }
+                if (r === 'wait') {
+                    pending.push({ chunk, encoding, callback });
+                    if (pending.length > 8) {
+                        verdict = true; // too much data without a verdict: allow
+                    } else {
+                        return;
                     }
-                } catch (_) {}
+                } else {
+                    verdict = r !== false;
+                }
+                if (verdict === false) {
+                    for (const p of pending) p.callback(new Error('Social media blocked for this device'));
+                    pending = [];
+                    return callback(new Error('Social media blocked for this device'));
+                }
+                const held = pending;
+                pending = [];
+                const items = [...held, { chunk, encoding, callback }];
+                let i = 0;
+                const next = () => {
+                    if (i >= items.length) return;
+                    const it = items[i++];
+                    speedStep(it.chunk, it.encoding, (err, out) => {
+                        if (err) return it.callback(err);
+                        it.callback(null, out);
+                        next();
+                    });
+                };
+                next();
+                return;
             }
-            const bytesPerSecond = getSpeed();
-            if (bytesPerSecond <= 0) return callback(new Error('User speed limit reached'));
-            if (bytesPerSecond === Infinity) return callback(null, chunk);
-            const bucket = getBucket(ip);
-            const delay = consumeTokens(bucket, chunk.length, bytesPerSecond);
-            if (delay <= 0) return callback(null, chunk);
-            setTimeout(() => callback(null, chunk), Math.ceil(delay));
+            speedStep(chunk, encoding, callback);
         }
     });
     limiter.on('error', () => {
@@ -818,15 +893,31 @@ function rateLimitedPipe(source, destination, getSpeed, ip, inspectFirstChunk = 
     source.pipe(limiter).pipe(destination);
 }
 
-// First-chunk inspector for upload pipes of social-blocked devices.
+// Stateful first-bytes inspector for upload pipes of social-blocked devices.
 // Catches IP-based flows (tunneled apps/browsers) via TLS SNI or HTTP Host.
-const makeSocialSniff = (clientIp, layer = 'SNI') => (chunk) => {
-    const dest = parseTlsSni(chunk) || parseHttpHost(chunk);
-    if (dest && isSocialHost(dest)) {
-        logSocialBlock(clientIp, dest, layer);
-        return false;
-    }
-    return true;
+// ClientHello often arrives split across chunks, so bytes accumulate (max 4KB)
+// until a hostname is found or the flow proves uninspectable. Returns
+// false = block, true = allow, 'wait' = need more bytes.
+const makeSocialSniff = (clientIp, layer = 'SNI') => {
+    let acc = Buffer.alloc(0);
+    return (chunk) => {
+        acc = Buffer.concat([acc, chunk]).subarray(0, 4096);
+        const dest = parseTlsSni(acc) || parseHttpHost(acc);
+        if (dest) {
+            if (isSocialHost(dest)) {
+                logSocialBlock(clientIp, dest, layer);
+                return false;
+            }
+            return true;
+        }
+        const looksTls = acc.length >= 1 && acc[0] === 0x16;
+        const head = acc.toString('latin1', 0, Math.min(acc.length, 16));
+        const looksHttp = /^(GET|POST |PUT|DELETE|HEAD|OPTIONS|PATCH|CONNECT)\s/i.test(head);
+        if ((!looksTls && !looksHttp && acc.length >= 16) || acc.length >= 4096) {
+            return true; // custom/binary protocol: nothing to match against
+        }
+        return 'wait';
+    };
 };
 
 function sendRateLimitedUdp(socket, message, port, host, getSpeed, ip) {
@@ -1013,7 +1104,7 @@ proxyServer.listen(PROXY_PORT, '0.0.0.0', () => {
 const socksServer = net.createServer((clientSocket) => {
     let clientIp = db.normalizeIp ? db.normalizeIp(clientSocket.remoteAddress) : (clientSocket.remoteAddress || '').replace(/^::ffff:/, '').trim();
 
-    diagLog('SOCKS5:CONNECT', `Incoming connection from client: ${clientIp}`);
+    netlog('SOCKS5:CONNECT', `Incoming connection from client: ${clientIp}`);
 
     if (!isAllowed(clientIp)) {
         diagLog('SOCKS5:REJECT', `Client ${clientIp} rejected by isAllowed (not registered, speed 0, or blocked)`);
@@ -1022,7 +1113,7 @@ const socksServer = net.createServer((clientSocket) => {
     }
 
     clientSocket.on('error', (e) => {
-        diagLog('SOCKS5:ERR', `Client ${clientIp} socket error: ${e.message}`);
+        netlog('SOCKS5:ERR', `Client ${clientIp} socket error: ${e.message}`);
     });
 
     let state = 'AUTH'; // AUTH -> REQUEST -> TUNNEL
@@ -1067,7 +1158,7 @@ const socksServer = net.createServer((clientSocket) => {
             const cmd = buffer[1];
             if (cmd === 0x03) { // UDP ASSOCIATE
                 clientSocket.removeListener('data', onData);
-                diagLog('SOCKS5:UDP_ASSOC_REQ', `Client ${clientIp} requested UDP Association`);
+                netlog('SOCKS5:UDP_ASSOC_REQ', `Client ${clientIp} requested UDP Association`);
                 handleSocksUdpAssociation(clientSocket, clientIp);
                 return;
             }
@@ -1115,7 +1206,7 @@ const socksServer = net.createServer((clientSocket) => {
             clientSocket.removeListener('data', onData);
             state = 'TUNNEL';
 
-            diagLog('SOCKS5:DIAL', `Client ${clientIp} -> ${host}:${port} (pipelined bytes: ${remainingData.length})`);
+            netlog('SOCKS5:DIAL', `Client ${clientIp} -> ${host}:${port} (pipelined bytes: ${remainingData.length})`);
 
             if (isSocialHost(host) && isSocialBlockedForIp(clientIp)) {
                 logSocialBlock(clientIp, host, 'SOCKS-HOST');
@@ -1126,7 +1217,7 @@ const socksServer = net.createServer((clientSocket) => {
 
             try {
                 const serverSocket = net.connect(port, host, () => {
-                    diagLog('SOCKS5:ESTABLISHED', `Tunnel open: ${clientIp} <-> ${host}:${port}`);
+                    netlog('SOCKS5:ESTABLISHED', `Tunnel open: ${clientIp} <-> ${host}:${port}`);
                     const reply = Buffer.from([0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
                     clientSocket.write(reply);
 
@@ -1171,13 +1262,13 @@ const socksServer = net.createServer((clientSocket) => {
                 const onEnd = () => {
                     clearInterval(interval);
                     saveStats();
-                    diagLog('SOCKS5:CLOSED', `Tunnel closed: ${clientIp} <-> ${host}:${port}`);
+                    netlog('SOCKS5:CLOSED', `Tunnel closed: ${clientIp} <-> ${host}:${port}`);
                 };
 
                 serverSocket.on('end', onEnd);
                 clientSocket.on('end', onEnd);
                 serverSocket.on('error', (err) => {
-                    diagLog('SOCKS5:REMOTE_ERR', `Remote ${host}:${port} error for ${clientIp}: ${err.message}`);
+                    netlog('SOCKS5:REMOTE_ERR', `Remote ${host}:${port} error for ${clientIp}: ${err.message}`);
                     clientSocket.destroy();
                 });
                 clientSocket.on('error', () => {
@@ -1242,23 +1333,26 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
 
             if (port === 53) {
                 const queried = parseDnsQueryName(payload);
-                diagLog('UDP:DNS_QUERY', `Client ${clientIp} -> queried DNS: ${queried || host}`);
+                netlog('UDP:DNS_QUERY', `Client ${clientIp} -> queried DNS: ${queried || host}`);
                 if (isSocialBlockedForIp(clientIp) && queried && isSocialHost(queried)) {
                     logSocialBlock(clientIp, queried, 'UDP-DNS');
                     diagLog('UDP:DNS_BLOCKED', `Blocked social DNS query ${queried} for ${clientIp}`);
                     return;
                 }
             } else {
-                diagLog('UDP:SEND', `Client ${clientIp} -> UDP ${host}:${port} (${payload.length}B)`);
+                netlog('UDP:SEND', `Client ${clientIp} -> UDP ${host}:${port} (${payload.length}B)`);
                 if (isSocialBlockedForIp(clientIp)) {
                     if (isSocialHost(host)) {
                         logSocialBlock(clientIp, host, 'UDP-HOST');
                         diagLog('UDP:HOST_BLOCKED', `Blocked social host ${host} on UDP for ${clientIp}`);
                         return;
                     }
-                    if (port === 443 && isSocialHost(host)) {
+                    // QUIC runs on UDP/443 with IP-only destinations (no visible
+                    // hostname): drop it so apps and browsers fall back to TCP/TLS
+                    // where SNI inspection applies.
+                    if (port === 443) {
                         logSocialBlock(clientIp, `${host}:${port}`, 'UDP-QUIC');
-                        diagLog('UDP:QUIC_BLOCKED', `Blocked social QUIC ${host}:${port} for ${clientIp}`);
+                        diagLog('UDP:QUIC_BLOCKED', `Blocked QUIC ${host}:${port} for ${clientIp} (TCP fallback)`);
                         return;
                     }
                 }
@@ -1275,7 +1369,7 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
             ...octets,
             rinfo.port >> 8, rinfo.port & 0xff
         ]);
-        diagLog('UDP:REPLY', `Relaying remote UDP response from ${rinfo.address}:${rinfo.port} -> ${clientIp}:${clientUdpPort}`);
+        netlog('UDP:REPLY', `Relaying remote UDP response from ${rinfo.address}:${rinfo.port} -> ${clientIp}:${clientUdpPort}`);
         sendRateLimitedUdp(relay, Buffer.concat([header, message]), clientUdpPort, clientIp, () => getSpeedForIp(clientIp), clientIp);
     });
 
@@ -1285,7 +1379,7 @@ function handleSocksUdpAssociation(clientSocket, clientIp) {
         if (localIp.startsWith('::ffff:')) localIp = localIp.substring(7);
         const octets = localIp.split('.').map(Number);
         const replyIp = octets.length === 4 && octets.every(Number.isFinite) ? octets : [0, 0, 0, 0];
-        diagLog('UDP:BOUND', `UDP relay bound on port ${relayPort} for client ${clientIp}`);
+        netlog('UDP:BOUND', `UDP relay bound on port ${relayPort} for client ${clientIp}`);
         clientSocket.write(Buffer.from([
             0x05, 0x00, 0x00, 0x01,
             ...replyIp,
