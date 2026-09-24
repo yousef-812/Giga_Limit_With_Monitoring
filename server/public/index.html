@@ -283,6 +283,11 @@
                 <button class="btn-small" onclick="updateGlobalLimit()" style="width: 80px; background: var(--primary); color: var(--bg);">حفظ</button>
                 <span id="global-msg" style="color: var(--success); font-size: 0.875rem; display: none;">تم الحفظ</span>
             </div>
+            <div style="width: 100%; display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-top: 0.75rem;">
+                <span style="font-size: 0.85rem; color: var(--text-muted);">تسجيل الأجهزة الجديدة:</span>
+                <button class="btn-small" id="reg-lock-btn" style="width: auto;" onclick="toggleRegistration()">...</button>
+                <span style="font-size: 0.75rem; color: var(--text-muted);">القفل يمنع أي جهاز جديد من التسجيل — الأجهزة المسجلة تفضل شغالة عادي.</span>
+            </div>
         </div>
         
         <h2 id="connected-devices-header" onclick="handleSecretClick()" style="font-size: 1.2rem; color: var(--text-muted); margin-bottom: 1rem; cursor: pointer; user-select: none;">الأجهزة المسجلة</h2>
@@ -402,6 +407,7 @@
             let displayStr = mb >= 1024 ? (mb / 1024).toFixed(2) + ' GB' : mb.toFixed(2) + ' MB';
             document.getElementById('global-total-usage').innerText = displayStr;
             document.getElementById('server-time-display').innerText = `تاريخ السيرفر: ${data.server_date} | الوقت: ${data.server_time}`;
+            updateRegLockBtn(data.registration_locked === true);
         }
 
         async function updateGlobalLimit() {
@@ -417,6 +423,25 @@
             const msg = document.getElementById('global-msg');
             msg.style.display = 'inline';
             setTimeout(() => msg.style.display = 'none', 2000);
+        }
+
+        function updateRegLockBtn(locked) {
+            const btn = document.getElementById('reg-lock-btn');
+            if (!btn) return;
+            btn.dataset.locked = locked ? '1' : '0';
+            btn.textContent = locked ? 'التسجيل مقفول 🔒 (اضغط للفتح)' : 'التسجيل مفتوح 🔓 (اضغط للقفل)';
+        }
+
+        async function toggleRegistration() {
+            const btn = document.getElementById('reg-lock-btn');
+            const locked = btn && btn.dataset.locked === '1';
+            const res = await fetch('/api/admin/toggle_registration', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': authToken },
+                body: JSON.stringify({ locked: !locked })
+            });
+            const data = await res.json().catch(() => ({}));
+            updateRegLockBtn(data.registration_locked === true);
         }
 
         async function loadUsers() {

@@ -326,6 +326,11 @@ app.post('/api/register', (req, res) => {
     if (!device_id || !name) return res.status(400).json({ error: 'device_id and name required' });
 
     const existing = db.getUserByDeviceId(device_id);
+    // Registration lock: new devices are rejected, known devices keep working.
+    if (!existing && db.getSetting('registration_locked') === true) {
+        diagLog('REGISTER_BLOCK', `rejected new device name=${name} device=${device_id} ip=${ip}`);
+        return res.status(403).json({ error: 'Registration is disabled by admin' });
+    }
     if (existing && existing.device_token && !db.verifyDeviceToken(device_id, device_token)) {
         return res.status(401).json({ error: 'Device is already registered' });
     }
@@ -554,6 +559,7 @@ app.get('/api/admin/global_settings', adminAuth, (req, res) => {
         global_speed_limit_bps: db.getSetting('global_speed_limit_bps') || 0,
         global_exhausted_speed_limit_bps: db.getSetting('global_exhausted_speed_limit_bps') || 0,
         global_total_bytes: db.getSetting('global_total_bytes_used') || 0,
+        registration_locked: db.getSetting('registration_locked') === true,
         server_date: db.getLocalDateString(),
         server_time: new Date().toLocaleTimeString()
     });
@@ -563,6 +569,13 @@ app.post('/api/admin/global_settings', adminAuth, (req, res) => {
     const { global_limit, global_weekly_limit, global_speed_limit_bps, global_exhausted_speed_limit_bps } = req.body;
     db.updateGlobalLimit(global_limit, global_weekly_limit, global_speed_limit_bps, global_exhausted_speed_limit_bps);
     res.json({ success: true });
+});
+
+app.post('/api/admin/toggle_registration', adminAuth, (req, res) => {
+    const { locked } = req.body;
+    db.setRegistrationLocked(locked);
+    diagLog('ADMIN', `new-device registration ${locked ? 'LOCKED' : 'OPENED'}`);
+    res.json({ success: true, registration_locked: db.getSetting('registration_locked') === true });
 });
 
 app.post('/api/admin/reset_user', adminAuth, (req, res) => {

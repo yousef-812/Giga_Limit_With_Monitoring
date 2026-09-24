@@ -117,6 +117,7 @@ if (!data.settings.global_daily_limit_mb) data.settings.global_daily_limit_mb = 
 if (!data.settings.global_weekly_limit_mb) data.settings.global_weekly_limit_mb = 7168;
 if (data.settings.global_speed_limit_bps === undefined) data.settings.global_speed_limit_bps = 0;
 if (data.settings.global_exhausted_speed_limit_bps === undefined) data.settings.global_exhausted_speed_limit_bps = 0;
+if (data.settings.registration_locked === undefined) data.settings.registration_locked = false;
 
 const getLocalDateString = () => {
     const d = new Date();
@@ -263,6 +264,12 @@ module.exports = {
             return true;
         }
         return false;
+    },
+
+    setRegistrationLocked: (locked) => {
+        data.settings.registration_locked = locked === true;
+        save();
+        return true;
     },
 
     getUsage: (user_id, date) => {
